@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GhostDrop P2P — Transferência e Chat Sem Rastros</title>
+  <meta name="description" content="Transferência de arquivos e chat P2P criptografado de ponta a ponta, sem intermediários e sem rastros.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="mqtt.min.js"></script>
+  <script src="qrcode.min.js"></script>
+</head>
+<body>
+  <div class="app-background">
+    <div class="glow-orb orb-1"></div>
+    <div class="glow-orb orb-2"></div>
+    <div class="glow-orb orb-3"></div>
+    <div class="grid-overlay"></div>
+  </div>
+
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo-group">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2v8"></path>
+            <path d="m4.93 10.93 1.41 1.41"></path>
+            <path d="M2 18h2"></path>
+            <path d="M20 18h2"></path>
+            <path d="m19.07 10.93-1.41 1.41"></path>
+            <path d="M22 22H2"></path>
+            <path d="m16 6-4-4-4 4"></path>
+            <path d="M16 18a4 4 0 0 0-8 0"></path>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title">GhostDrop <span class="badge-tag">P2P v1.2</span></div>
+          <p class="brand-subtitle">Transferência Bidirecional • Chat Criptografado • Zero Rastros</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <div class="privacy-pill" id="securityPill">
+          <span class="status-dot green" id="statusDot"></span>
+          <span class="pill-text" id="statusPillText">E2EE DTLS Pronto</span>
+        </div>
+        <button id="panicButton" class="btn-panic" title="Encerra o executável e destrói toda a memória da sessão">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
+          Encerrar & Limpar
+        </button>
+      </div>
+    </header>
+
+    <!-- BEFORE CONNECTION: Navigation Tabs -->
+    <div id="pairingSection">
+      <nav class="nav-tabs">
+        <button class="tab-btn active" id="tabSendBtn" onclick="switchTab('send')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"></path><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+          Criar Sala de Conexão
+        </button>
+        <button class="tab-btn" id="tabReceiveBtn" onclick="switchTab('receive')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+          Entrar com Código
+        </button>
+        <button class="tab-btn" id="tabSecurityBtn" onclick="switchTab('security')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          Segurança & Rede
+        </button>
+      </nav>
+
+      <!-- Main Pairing Card -->
+      <main class="main-card">
+        
+        <!-- TAB 1: HOST / CREATE ROOM -->
+        <section id="tabSend" class="tab-content active">
+          <div class="host-hero">
+            <div class="pairing-title">
+              <span class="step-badge">1</span>
+              <span>Compartilhe o código de 6 dígitos com o outro computador:</span>
+            </div>
+            
+            <div class="code-display-wrap">
+              <div class="code-display" id="senderPairingCode">------</div>
+              <button class="btn-action" id="copyCodeBtn" title="Copiar Código">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                Copiar
+              </button>
+              <button class="btn-action secondary" id="showQrBtn" title="Exibir QR Code">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+                QR Code
+              </button>
+            </div>
+
+            <div class="qr-modal-container hidden" id="qrContainer">
+              <div id="qrcode"></div>
+              <p class="qr-hint">Aponte a câmera para parear instantaneamente</p>
+            </div>
+
+            <div class="status-banner" id="senderStatusBanner">
+              <div class="pulse-indicator"></div>
+              <span id="senderStatusText">Aguardando o outro participante conectar...</span>
+            </div>
+
+            <div class="quick-tips-box">
+              <p>💡 <strong>Após a conexão:</strong> Uma sala de chat criptografada será aberta automaticamente, permitindo <strong>conversar em tempo real e enviar quantos arquivos quiser em ambas as direções</strong>!</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 2: JOIN / ENTER CODE -->
+        <section id="tabReceive" class="tab-content">
+          <div class="receive-hero">
+            <div class="receive-icon-wrap">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+            </div>
+            <h2>Conectar a um Parceiro P2P</h2>
+            <p>Digite o código de 6 dígitos gerado pela outra máquina para estabelecer túnel direto.</p>
+          </div>
+
+          <div class="receive-input-box">
+            <label for="receiveCodeInput" class="input-label">Código de Pareamento:</label>
+            <div class="code-input-row">
+              <input type="text" id="receiveCodeInput" maxlength="7" placeholder="Ex: 849-210" autocomplete="off" spellcheck="false">
+              <button id="btnConnectReceiver" class="btn-primary">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
+                Conectar
+              </button>
+            </div>
+
+            <div class="status-banner hidden" id="receiverStatusBanner">
+              <div class="pulse-indicator" id="receiverPulse"></div>
+              <span id="receiverStatusText">Conectando ao parceiro...</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 3: SECURITY -->
+        <section id="tabSecurity" class="tab-content">
+          <div class="security-grid">
+            <div class="sec-card">
+              <div class="sec-icon">🛡️</div>
+              <h3>Zero Rastros & Zero Logs</h3>
+              <p>Os arquivos e mensagens de chat <strong>nunca</strong> passam por servidores em nuvem. O tráfego vai diretamente entre as duas placas de rede via WebRTC.</p>
+            </div>
+
+            <div class="sec-card">
+              <div class="sec-icon">🔐</div>
+              <h3>Criptografia Dupla (E2EE + DTLS)</h3>
+              <p>O sinal de pareamento é protegido com AES-256-GCM derivado do código. Os dados e o chat são transmitidos por túnel DTLS 1.3 autenticado.</p>
+            </div>
+
+            <div class="sec-card">
+              <div class="sec-icon">🌐</div>
+              <h3>Travessia de NAT (STUN)</h3>
+              <p>Funciona entre computadores em redes diferentes, provedores diferentes, 4G/5G ou Wi-Fi local sem configurações adicionais.</p>
+            </div>
+
+            <div class="sec-card">
+              <div class="sec-icon">🔄</div>
+              <h3>Bidirecional Total</h3>
+              <p>Qualquer um dos dois participantes pode enviar mensagens e múltiplos arquivos de qualquer tamanho a qualquer momento.</p>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+
+    <!-- AFTER CONNECTION: ACTIVE P2P ROOM (CHAT + BIDIRECTIONAL FILE SHARING) -->
+    <div id="activeRoomSection" class="active-room-section hidden">
+      <div class="room-top-bar">
+        <div class="room-peer-badge">
+          <span class="status-dot green pulse"></span>
+          <span>Conectado com Peer</span>
+          <span class="room-code-tag" id="activeRoomCode">#000-000</span>
+        </div>
+        <div class="room-actions">
+          <button id="btnDisconnect" class="btn-disconnect" title="Desconectar do peer atual">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
+            Desconectar
+          </button>
+        </div>
+      </div>
+
+      <div class="room-main-grid">
+        <!-- LEFT PANEL: CHAT -->
+        <div class="chat-panel">
+          <div class="panel-header">
+            <div class="panel-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+              <span>Chat Criptografado E2EE</span>
+            </div>
+            <span class="chat-ephemeral-hint">Mensagens em RAM (não salvas)</span>
+          </div>
+
+          <div class="chat-messages" id="chatMessages">
+            <div class="chat-system-msg">
+              <span>🔒 Conexão segura estabelecida. Mensagens e arquivos são transmitidos diretamente P2P.</span>
+            </div>
+          </div>
+
+          <div class="typing-indicator-bar hidden" id="typingIndicator">
+            <span>O outro participante está digitando...</span>
+          </div>
+
+          <form id="chatForm" class="chat-input-row" onsubmit="return false;">
+            <input type="text" id="chatInput" placeholder="Digite uma mensagem secreta..." autocomplete="off">
+            <button type="submit" id="btnSendChat" class="btn-send-chat" title="Enviar Mensagem">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+            </button>
+          </form>
+        </div>
+
+        <!-- RIGHT PANEL: FILE SHARING HUB -->
+        <div class="files-panel">
+          <div class="panel-header">
+            <div class="panel-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+              <span>Envio Bidirecional de Arquivos</span>
+            </div>
+            <span class="file-size-hint">Sem limite de tamanho</span>
+          </div>
+
+          <!-- Direct Drop Zone in Room -->
+          <div class="room-drop-zone" id="roomDropZone">
+            <input type="file" id="roomFileInput" class="file-input-hidden" multiple>
+            <div class="room-drop-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="17 8 12 3 7 8"></polyline>
+                <line x1="12" y1="3" x2="12" y2="15"></line>
+              </svg>
+            </div>
+            <p class="room-drop-text">Arraste arquivos aqui ou <span class="highlight-link">clique para enviar</span></p>
+          </div>
+
+          <!-- Transfers List -->
+          <div class="transfers-container">
+            <div class="transfers-title">Transferências na Sessão</div>
+            <div class="transfers-list" id="transfersList">
+              <div class="empty-transfers" id="emptyTransfersMsg">
+                Nenhum arquivo transferido ainda. Arraste arquivos acima para enviar ao parceiro.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LIVE TRANSFER OVERLAY MODAL -->
+    <div id="transferOverlay" class="transfer-overlay hidden">
+      <div class="transfer-modal">
+        <div class="transfer-header">
+          <h3 id="transferModalTitle">Transferindo Arquivos...</h3>
+          <span class="transfer-state-pill" id="transferStatePill">Em Andamento</span>
+        </div>
+
+        <div class="current-file-info">
+          <div class="file-name-row">
+            <span class="file-name-text" id="transferCurrentFileName">arquivo.iso</span>
+            <span class="file-percent" id="transferPercent">0%</span>
+          </div>
+          
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="progressBarFill"></div>
+          </div>
+
+          <div class="transfer-stats-grid">
+            <div class="stat-item">
+              <span class="stat-label">Velocidade</span>
+              <span class="stat-value" id="transferSpeed">0.0 MB/s</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">Enviado / Total</span>
+              <span class="stat-value" id="transferBytes">0 MB / 0 MB</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">Tempo Restante</span>
+              <span class="stat-value" id="transferEta">Calculando...</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">Integridade SHA-256</span>
+              <span class="stat-value mono-small" id="transferHash">Calculando...</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="transfer-footer">
+          <button id="btnCancelTransfer" class="btn-cancel">Cancelar</button>
+          <button id="btnCloseTransferModal" class="btn-primary hidden">Concluir</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- INCOMING FILE CONFIRMATION MODAL -->
+    <div id="incomingModal" class="transfer-overlay hidden">
+      <div class="transfer-modal">
+        <div class="transfer-header">
+          <h3>Recebimento de Arquivo</h3>
+          <span class="transfer-state-pill" style="background:rgba(16,185,129,0.2);color:#6ee7b7;">Novo Envio</span>
+        </div>
+        <div class="incoming-header" style="margin-bottom:18px;">
+          <div class="incoming-icon">📦</div>
+          <div class="incoming-details">
+            <h4 id="incomingModalFileName" style="font-size:1.1rem;color:#f8fafc;">documento.zip</h4>
+            <p><span id="incomingModalFileSize" style="color:#38bdf8;font-family:var(--font-mono);">0 MB</span> • <span id="incomingModalFileCount">1 arquivo(s)</span></p>
+          </div>
+        </div>
+        <div class="incoming-actions">
+          <button id="btnModalAccept" class="btn-accept" style="padding:12px;">Aceitar & Baixar</button>
+          <button id="btnModalReject" class="btn-reject" style="padding:12px;">Recusar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <span>GhostDrop P2P Standalone • Conexão Ponto a Ponto Criptografada</span>
+      <span class="server-info">Servidor Local: <span id="serverAddress" class="mono">127.0.0.1</span></span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
