@@ -1,4 +1,4 @@
-('C:\\Users\\pedro.sarmento\\Desktop\\código\\p2p\\build\\GhostDrop-P2P\\PYZ-00.pyz',
+('C:\\Users\\pedro.sarmento\\Desktop\\código\\p2p\\.git\\GhostDrop-P2P\\build\\GhostDrop-P2P\\PYZ-00.pyz',
  [('__future__', 'C:\\Python314\\Lib\\__future__.py', 'PYMODULE'),
   ('_aix_support', 'C:\\Python314\\Lib\\_aix_support.py', 'PYMODULE'),
   ('_ast_unparse', 'C:\\Python314\\Lib\\_ast_unparse.py', 'PYMODULE'),

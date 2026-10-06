@@ -1,73 +1,143 @@
-# 👻 GhostDrop P2P — Transferência Segura Sem Rastros
+# 👻 GhostDrop P2P (v2.0) — Transferência e Chat Multi-Peer Sem Rastros
 
-**GhostDrop P2P** é um aplicativo de transferência de arquivos Ponto-a-Ponto (P2P) ultra-rápido, seguro e privado, projetado para funcionar em qualquer computador com **Windows** como um único executável (`.exe`), **sem necessidade de instalar nada nem configurar portas de roteador**.
+[![Web App](https://img.shields.io/badge/Web%20App-ghostdropp2p.netlify.app-00c7b7?style=for-the-badge&logo=netlify)](https://ghostdropp2p.netlify.app/)
+[![Licença](https://img.shields.io/badge/Licen%C3%A7a-MIT-blue?style=for-the-badge)](LICENSE)
+[![WebRTC](https://img.shields.io/badge/Protocolo-WebRTC%20DataChannel-orange?style=for-the-badge)](https://webrtc.org/)
+[![Segurança](https://img.shields.io/badge/Criptografia-DTLS%201.3%20%2B%20AES--256-green?style=for-the-badge)]()
+
+**GhostDrop P2P** é uma plataforma descentralizada de **transferência de arquivos e chat em grupo**, ultra-rápida, privada e segura. Ela opera de forma **Ponto-a-Ponto (P2P em malha WebRTC Mesh)** sem intermediários — os dados nunca passam nem são armazenados em servidores.
+
+Disponível tanto na **Web (acesso instantâneo sem instalação)** quanto como **executável autônomo para Windows (`.exe`)**.
+
+🔗 **Acesse online:** [https://ghostdropp2p.netlify.app/](https://ghostdropp2p.netlify.app/)
 
 ---
 
 ## 🌟 Principais Recursos
 
-1. **Compartilhamento Direto P2P (WebRTC DataChannel)**:
-   - Os arquivos são transmitidos diretamente da placa de rede do remetente para a do destinatário via túnel SCTP/DTLS.
-   - Os arquivos **nunca** passam nem são salvos em nenhum servidor ou nuvem.
-2. **Funciona em Redes Diferentes (Cross-Network / Internet)**:
-   - Equipado com travessia automática de NAT por meio de servidores STUN públicos (Google e Cloudflare).
-   - Funciona entre computadores em Wi-Fi diferentes, 4G/5G ou locais remotos sem redirecionamento de portas (port forwarding).
-3. **Pareamento Ultra-Fácil**:
-   - Gera um código numérico amigável de 6 dígitos (Ex: `749-312`).
-   - Suporte a **QR Code** para leitura por dispositivos com câmera.
-   - Suporte a links diretos para conexão em 1 clique.
-4. **Zero Rastros (Stealth & Privacidade)**:
-   - **Sinalização Efêmera**: Utiliza brokers MQTT em memória (RAM-only). As mensagens de pareamento têm retenção desativada (`retain: false`) e são destruídas no instante em que são entregues.
-   - **Criptografia E2EE de Sinal**: Os metadados e ofertas SDP são criptografados com **AES-256-GCM** com chave derivada por **PBKDF2** diretamente no navegador a partir do código de pareamento.
-   - **Botão de Pânico / Limpeza**: Encerra o processo local e remove os buffers da memória RAM com 1 clique.
-5. **Portabilidade Máxima (.EXE Único)**:
-   - Compilado em um único binário executável (`GhostDrop-P2P.exe`).
-   - Sem dependência de Python instalado, sem dependência de DLLs externas, sem instalador.
-   - Basta dar duplo-clique para rodar.
+### 👥 1. Suporte a Múltiplos Participantes (Multi-Peer WebRTC Mesh)
+- Conecte **várias pessoas na mesma sala** simultaneamente através de um único código de 6 dígitos.
+- Topologia em **malha completa descentralizada (Full Mesh)**: cada dispositivo conecta-se diretamente a todos os outros participantes via canais WebRTC independentes.
+- Notificações automáticas de entrada e saída de membros na sala.
+
+### 🏷️ 2. Sistema de Apelidos Personalizados (Nicknames)
+- Escolha e edite seu **apelido (nickname)** a qualquer momento diretamente na interface.
+- Identificação visual imediata de quem enviou cada mensagem e arquivo com avatares e paletas de cores dinâmicas.
+- Indicador de digitação em tempo real: saiba quem está digitando no grupo.
+
+### 📁 3. Transferência Bidirecional de Arquivos Sem Limites
+- Envie arquivos de **qualquer formato e tamanho** diretamente da sua placa de rede para os outros dispositivos.
+- Arraste e solte múltiplos arquivos simultaneamente.
+- Controle de fluxo com **backpressure** para máxima velocidade e estabilidade.
+- Validação automática de integridade bit-a-bit com **Hash SHA-256** em cada transferência.
+
+### 💬 4. Chat em Grupo Criptografado (E2EE)
+- Troque mensagens instantâneas com todos os membros da sala.
+- Mensagens mantidas estritamente na memória volátil (RAM) da sessão — **nada é salvo em disco ou banco de dados**.
+
+### 🔒 5. Zero Rastros (Stealth & Privacidade Extrema)
+- **Sinalização Efêmera**: Sinalização de pareamento via brokers MQTT em memória RAM, com retenção desativada (`retain: false`).
+- **Criptografia Dupla**:
+  - **Sinalização:** Criptografada de ponta a ponta com **AES-256-GCM** e chave derivada por **PBKDF2** a partir do código da sala.
+  - **Dados & Chat:** Túnel seguro **DTLS 1.3 / SCTP** com autenticação criptográfica nativa do WebRTC.
+- **Botão de Pânico**: Finaliza a sessão instantaneamente e limpa todos os buffers da memória.
+
+### 🌐 6. Travessia de NAT (Cross-Network / Internet)
+- Servidores STUN públicos (Google e Cloudflare) integrados.
+- Funciona entre redes diferentes (Wi-Fi de casa, 4G/5G, escritórios, etc.) sem necessidade de abrir portas no roteador.
 
 ---
 
-## 🚀 Como Executar
+## 🚀 Como Usar
 
-### Opção 1: Executável Pronto (`.exe`)
-Basta entrar na pasta `dist/` e dar dois cliques no arquivo:
-```
-dist\GhostDrop-P2P.exe
-```
-O aplicativo abrirá automaticamente a interface moderna no seu navegador padrão.
+### Opção 1: Diretamente no Navegador (Recomendado)
+Acesse a versão web hospedada:
+👉 **[https://ghostdropp2p.netlify.app/](https://ghostdropp2p.netlify.app/)**
 
-### Opção 2: Modo Linha de Comando (CLI / Opções Avançadas)
+Compatível com todos os navegadores modernos (Chrome, Firefox, Edge, Safari, Brave, Opera) em computadores, notebooks, tablets e smartphones (Android / iOS).
+
+---
+
+### Opção 2: Executável Autônomo Windows (`GhostDrop-P2P.exe`)
+Ideal para uso offline ou em ambientes restritos, sem necessidade de instalar Python nem dependências:
+
+1. Acesse a pasta `dist/`.
+2. Dê dois cliques no arquivo:
+   ```powershell
+   dist\GhostDrop-P2P.exe
+   ```
+3. A interface abrirá automaticamente no seu navegador padrão.
+
+#### Opções de Linha de Comando (Avançado)
 ```powershell
-# Executar em uma porta específica
+# Executar em uma porta personalizada
 .\dist\GhostDrop-P2P.exe --port 9000
 
-# Executar sem abrir o navegador automaticamente
+# Executar em segundo plano sem abrir o navegador
 .\dist\GhostDrop-P2P.exe --no-browser
 ```
 
-### Opção 3: Executar a partir do código fonte (Python)
+---
+
+### Opção 3: Executar a partir do Código Fonte (Python)
 ```powershell
+# Clone o repositório
+git clone https://github.com/PLSchultz/GhostDrop-P2P.git
+cd GhostDrop-P2P
+
+# Inicie o servidor local
 python main.py
 ```
 
 ---
 
-## 🔨 Como Compilar Novamente (`build.bat`)
+## 📖 Passo a Passo: Como Conectar em Grupo
 
-Para gerar um novo arquivo `.exe` a qualquer momento, execute o script:
-```powershell
-.\build.bat
+```mermaid
+graph TD
+    A[Criador: Gera Sala #749-312] -->|Compartilha Código / Link / QR| B[Participante 2]
+    A -->|Compartilha Código / Link / QR| C[Participante 3]
+    B <-->|Túnel WebRTC Direto| A
+    C <-->|Túnel WebRTC Direto| A
+    B <-->|Túnel WebRTC Direto| C
 ```
-O executável final será salvo na pasta `dist/GhostDrop-P2P.exe`.
+
+1. **Defina seu Apelido**: Digite seu nome ou apelido no campo de perfil no topo da página.
+2. **Criar Sala**:
+   - Clique em **"Criar Sala Multi-Peer"**.
+   - Compartilhe o código de 6 dígitos (ou envie o link / QR Code).
+   - Clique em **"Abrir Sala Agora"**.
+3. **Entrar na Sala**:
+   - Os outros participantes acessam o link ou entram na aba **"Entrar com Código"** e inserem o código de 6 dígitos.
+4. **Pronto!** Todos os participantes estarão conectados em malha direta para conversar e transferir arquivos.
 
 ---
 
-## 🔒 Arquitetura de Segurança
+## 🔨 Como Compilar Novamente (`build.bat`)
 
-| Camada | Tecnologia | Função |
+Para gerar um novo executável compilado com PyInstaller no Windows:
+
+```powershell
+.\build.bat
+```
+
+O script criará o executável otimizado em `dist/GhostDrop-P2P.exe`.
+
+---
+
+## 🛡️ Arquitetura de Segurança & Tecnologias
+
+| Camada | Tecnologia | Finalidade |
 | :--- | :--- | :--- |
-| **Transporte de Dados** | WebRTC DataChannels | Envio P2P direto entre máquinas com DTLS 1.3 |
-| **Travessia de NAT** | STUN (Google & Cloudflare) | Descoberta de IP público e abertura de portas NAT |
-| **Sinalização** | Ephemeral WSS MQTT | Troca de SDP e ICE sem armazenamento ou log |
-| **Criptografia de Sinal** | AES-256-GCM + PBKDF2 | Proteção criptográfica de ponta a ponta do código de pareamento |
-| **Integridade** | SHA-256 Checksum | Verificação automática de integridade bit a bit após o download |
+| **Topologia** | WebRTC DataChannels Full Mesh | Conexão ponto a ponto direta entre todos os nós |
+| **Criptografia de Dados** | DTLS 1.3 / SCTP | Túnel criptográfico autenticado para chat e arquivos |
+| **Travessia de NAT** | STUN (Google & Cloudflare) | Descoberta de candidatos ICE e conexão cross-network |
+| **Sinalização** | Ephemeral WSS MQTT (RAM-only) | Negociação de ofertas SDP e ICE sem logs ou persistência |
+| **Criptografia de Sinal** | AES-256-GCM + PBKDF2 (50.000 iterações) | Proteção do payload de sinalização a partir do código da sala |
+| **Integridade** | SHA-256 Digest | Verificação matemática bit a bit após a recepção do arquivo |
+
+---
+
+## 📄 Licença
+
+Distribuído sob a licença **MIT**. Veja o arquivo `LICENSE` para mais detalhes.

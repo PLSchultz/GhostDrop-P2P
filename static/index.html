@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>GhostDrop P2P — Transferência e Chat Sem Rastros</title>
-  <meta name="description" content="Transferência de arquivos e chat P2P criptografado de ponta a ponta, sem intermediários e sem rastros.">
+  <title>GhostDrop P2P — Transferência e Chat Multi-Peer Sem Rastros</title>
+  <meta name="description" content="Transferência de arquivos e chat P2P criptografado de ponta a ponta para múltiplos participantes, sem intermediários e sem rastros.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
@@ -37,16 +37,23 @@
           </svg>
         </div>
         <div>
-          <div class="brand-title">GhostDrop <span class="badge-tag">P2P v1.2</span></div>
-          <p class="brand-subtitle">Transferência Bidirecional • Chat Criptografado • Zero Rastros</p>
+          <div class="brand-title">GhostDrop <span class="badge-tag">P2P v2.0</span></div>
+          <p class="brand-subtitle">Multi-Peer • Chat em Grupo • Transferência Direta • Zero Rastros</p>
         </div>
       </div>
 
       <div class="header-actions">
+        <!-- Nickname pill in header -->
+        <div class="user-nickname-box" title="Clique para editar seu apelido">
+          <span class="nick-icon">👤</span>
+          <input type="text" id="globalNicknameInput" class="header-nick-input" placeholder="Seu apelido" maxlength="18" spellcheck="false" autocomplete="off">
+        </div>
+
         <div class="privacy-pill" id="securityPill">
           <span class="status-dot green" id="statusDot"></span>
           <span class="pill-text" id="statusPillText">E2EE DTLS Pronto</span>
         </div>
+
         <button id="panicButton" class="btn-panic" title="Encerra o executável e destrói toda a memória da sessão">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
           Encerrar & Limpar
@@ -59,7 +66,7 @@
       <nav class="nav-tabs">
         <button class="tab-btn active" id="tabSendBtn" onclick="switchTab('send')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"></path><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-          Criar Sala de Conexão
+          Criar Sala Multi-Peer
         </button>
         <button class="tab-btn" id="tabReceiveBtn" onclick="switchTab('receive')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
@@ -79,7 +86,7 @@
           <div class="host-hero">
             <div class="pairing-title">
               <span class="step-badge">1</span>
-              <span>Compartilhe o código de 6 dígitos com o outro computador:</span>
+              <span>Código da sua Sala (Qualquer pessoa pode se juntar):</span>
             </div>
             
             <div class="code-display-wrap">
@@ -87,6 +94,10 @@
               <button class="btn-action" id="copyCodeBtn" title="Copiar Código">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
                 Copiar
+              </button>
+              <button class="btn-action secondary" id="copyLinkBtn" title="Copiar Link de Convite Direto">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+                Link
               </button>
               <button class="btn-action secondary" id="showQrBtn" title="Exibir QR Code">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
@@ -99,13 +110,20 @@
               <p class="qr-hint">Aponte a câmera para parear instantaneamente</p>
             </div>
 
+            <div class="start-room-action-row">
+              <button id="btnEnterCreatedRoom" class="btn-primary-large">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><polyline points="10 17 15 12 10 7"></polyline><line x1="15" y1="12" x2="3" y2="12"></line></svg>
+                Abrir Sala Agora
+              </button>
+            </div>
+
             <div class="status-banner" id="senderStatusBanner">
               <div class="pulse-indicator"></div>
-              <span id="senderStatusText">Aguardando o outro participante conectar...</span>
+              <span id="senderStatusText">Aguardando participantes entrarem com o código...</span>
             </div>
 
             <div class="quick-tips-box">
-              <p>💡 <strong>Após a conexão:</strong> Uma sala de chat criptografada será aberta automaticamente, permitindo <strong>conversar em tempo real e enviar quantos arquivos quiser em ambas as direções</strong>!</p>
+              <p>👥 <strong>Suporte Multi-Peer:</strong> Múltiplas pessoas podem se conectar à mesma sala simultaneamente via malha direta WebRTC (Mesh). Todos no grupo podem conversar em tempo real com apelidos visíveis e trocar arquivos sem servidores intermediários!</p>
             </div>
           </div>
         </section>
@@ -120,23 +138,23 @@
                 <line x1="12" y1="15" x2="12" y2="3"></line>
               </svg>
             </div>
-            <h2>Conectar a um Parceiro P2P</h2>
-            <p>Digite o código de 6 dígitos gerado pela outra máquina para estabelecer túnel direto.</p>
+            <h2>Entrar em uma Sala Multi-Peer</h2>
+            <p>Digite o código de 6 dígitos gerado pela sala para entrar no grupo P2P.</p>
           </div>
 
           <div class="receive-input-box">
-            <label for="receiveCodeInput" class="input-label">Código de Pareamento:</label>
+            <label for="receiveCodeInput" class="input-label">Código da Sala:</label>
             <div class="code-input-row">
               <input type="text" id="receiveCodeInput" maxlength="7" placeholder="Ex: 849-210" autocomplete="off" spellcheck="false">
               <button id="btnConnectReceiver" class="btn-primary">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
-                Conectar
+                Entrar na Sala
               </button>
             </div>
 
             <div class="status-banner hidden" id="receiverStatusBanner">
               <div class="pulse-indicator" id="receiverPulse"></div>
-              <span id="receiverStatusText">Conectando ao parceiro...</span>
+              <span id="receiverStatusText">Conectando à sala...</span>
             </div>
           </div>
         </section>
@@ -147,25 +165,25 @@
             <div class="sec-card">
               <div class="sec-icon">🛡️</div>
               <h3>Zero Rastros & Zero Logs</h3>
-              <p>Os arquivos e mensagens de chat <strong>nunca</strong> passam por servidores em nuvem. O tráfego vai diretamente entre as duas placas de rede via WebRTC.</p>
+              <p>Os arquivos e mensagens de chat <strong>nunca</strong> passam nem são salvos em servidores na nuvem. O tráfego vai de ponta a ponta entre os nós via WebRTC DataChannels.</p>
             </div>
 
             <div class="sec-card">
               <div class="sec-icon">🔐</div>
               <h3>Criptografia Dupla (E2EE + DTLS)</h3>
-              <p>O sinal de pareamento é protegido com AES-256-GCM derivado do código. Os dados e o chat são transmitidos por túnel DTLS 1.3 autenticado.</p>
+              <p>O sinal de pareamento é protegido com AES-256-GCM derivado por PBKDF2 do código da sala. O tráfego direto é criptografado com DTLS 1.3 autenticado.</p>
             </div>
 
             <div class="sec-card">
-              <div class="sec-icon">🌐</div>
-              <h3>Travessia de NAT (STUN)</h3>
-              <p>Funciona entre computadores em redes diferentes, provedores diferentes, 4G/5G ou Wi-Fi local sem configurações adicionais.</p>
+              <div class="sec-icon">👥</div>
+              <h3>Multi-Peer Mesh (Salas em Grupo)</h3>
+              <p>Permite 2 ou mais pessoas na mesma sala de forma descentralizada em malha completa (Full Mesh), cada participante conectado diretamente aos demais.</p>
             </div>
 
             <div class="sec-card">
-              <div class="sec-icon">🔄</div>
-              <h3>Bidirecional Total</h3>
-              <p>Qualquer um dos dois participantes pode enviar mensagens e múltiplos arquivos de qualquer tamanho a qualquer momento.</p>
+              <div class="sec-icon">🏷️</div>
+              <h3>Apelidos Personalizados</h3>
+              <p>Identificação clara de quem enviou cada mensagem e arquivo, com cores dinâmicas e notificações instantâneas de entrada e saída.</p>
             </div>
           </div>
         </section>
@@ -173,19 +191,44 @@
       </main>
     </div>
 
-    <!-- AFTER CONNECTION: ACTIVE P2P ROOM (CHAT + BIDIRECTIONAL FILE SHARING) -->
+    <!-- AFTER CONNECTION: ACTIVE MULTI-PEER ROOM (CHAT + FILE SHARING) -->
     <div id="activeRoomSection" class="active-room-section hidden">
       <div class="room-top-bar">
-        <div class="room-peer-badge">
-          <span class="status-dot green pulse"></span>
-          <span>Conectado com Peer</span>
-          <span class="room-code-tag" id="activeRoomCode">#000-000</span>
+        <div class="room-left-info">
+          <div class="room-peer-badge">
+            <span class="status-dot green pulse"></span>
+            <span>Sala Multi-Peer</span>
+            <span class="room-code-tag" id="activeRoomCode" title="Código da sala">#000-000</span>
+          </div>
+
+          <!-- Participants count pill -->
+          <div class="participants-pill" id="participantsPill" title="Participantes conectados">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+            <span id="participantCountText">1 pessoa (você)</span>
+          </div>
         </div>
+
         <div class="room-actions">
-          <button id="btnDisconnect" class="btn-disconnect" title="Desconectar do peer atual">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
-            Desconectar
+          <button id="btnRoomCopyCode" class="btn-action-small" title="Copiar Código da Sala">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            Copiar Código
           </button>
+          <button id="btnRoomCopyLink" class="btn-action-small" title="Copiar Link de Convite">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+            Convidar Link
+          </button>
+          <button id="btnDisconnect" class="btn-disconnect" title="Sair desta sala">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
+            Sair da Sala
+          </button>
+        </div>
+      </div>
+
+      <!-- Connected Participants Bar -->
+      <div class="participants-list-bar" id="participantsListBar">
+        <span class="participants-label">No grupo:</span>
+        <div class="participants-chips" id="participantsChips">
+          <!-- Dynamically populated chips -->
         </div>
       </div>
 
@@ -195,23 +238,23 @@
           <div class="panel-header">
             <div class="panel-title">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
-              <span>Chat Criptografado E2EE</span>
+              <span>Chat do Grupo Criptografado</span>
             </div>
-            <span class="chat-ephemeral-hint">Mensagens em RAM (não salvas)</span>
+            <span class="chat-ephemeral-hint">Mensagens em RAM (não gravadas)</span>
           </div>
 
           <div class="chat-messages" id="chatMessages">
             <div class="chat-system-msg">
-              <span>🔒 Conexão segura estabelecida. Mensagens e arquivos são transmitidos diretamente P2P.</span>
+              <span>🔒 Conexão segura estabelecida. Mensagens e arquivos são transmitidos diretamente entre os nós P2P.</span>
             </div>
           </div>
 
           <div class="typing-indicator-bar hidden" id="typingIndicator">
-            <span>O outro participante está digitando...</span>
+            <span id="typingIndicatorText">Alguém está digitando...</span>
           </div>
 
           <form id="chatForm" class="chat-input-row" onsubmit="return false;">
-            <input type="text" id="chatInput" placeholder="Digite uma mensagem secreta..." autocomplete="off">
+            <input type="text" id="chatInput" placeholder="Digite uma mensagem para o grupo..." autocomplete="off">
             <button type="submit" id="btnSendChat" class="btn-send-chat" title="Enviar Mensagem">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
             </button>
@@ -223,7 +266,7 @@
           <div class="panel-header">
             <div class="panel-title">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
-              <span>Envio Bidirecional de Arquivos</span>
+              <span>Envio de Arquivos no Grupo</span>
             </div>
             <span class="file-size-hint">Sem limite de tamanho</span>
           </div>
@@ -238,15 +281,15 @@
                 <line x1="12" y1="3" x2="12" y2="15"></line>
               </svg>
             </div>
-            <p class="room-drop-text">Arraste arquivos aqui ou <span class="highlight-link">clique para enviar</span></p>
+            <p class="room-drop-text">Arraste arquivos aqui ou <span class="highlight-link">clique para enviar a todos</span></p>
           </div>
 
           <!-- Transfers List -->
           <div class="transfers-container">
-            <div class="transfers-title">Transferências na Sessão</div>
+            <div class="transfers-title">Histórico de Arquivos da Sessão</div>
             <div class="transfers-list" id="transfersList">
               <div class="empty-transfers" id="emptyTransfersMsg">
-                Nenhum arquivo transferido ainda. Arraste arquivos acima para enviar ao parceiro.
+                Nenhum arquivo transferido nesta sessão. Arraste arquivos acima para enviar aos participantes conectados.
               </div>
             </div>
           </div>
@@ -310,7 +353,7 @@
           <div class="incoming-icon">📦</div>
           <div class="incoming-details">
             <h4 id="incomingModalFileName" style="font-size:1.1rem;color:#f8fafc;">documento.zip</h4>
-            <p><span id="incomingModalFileSize" style="color:#38bdf8;font-family:var(--font-mono);">0 MB</span> • <span id="incomingModalFileCount">1 arquivo(s)</span></p>
+            <p><span id="incomingModalFileSize" style="color:#38bdf8;font-family:var(--font-mono);">0 MB</span> • Enviado por <strong id="incomingModalSenderName" style="color:#a5b4fc;">Alguém</strong></p>
           </div>
         </div>
         <div class="incoming-actions">
@@ -322,8 +365,8 @@
 
     <!-- Footer -->
     <footer class="footer">
-      <span>GhostDrop P2P Standalone • Conexão Ponto a Ponto Criptografada</span>
-      <span class="server-info">Servidor Local: <span id="serverAddress" class="mono">127.0.0.1</span></span>
+      <span>GhostDrop P2P v2.0 • Conexão Multi-Peer Direta Criptografada</span>
+      <span class="server-info">Status: <span id="serverAddress" class="mono">WebRTC Mesh Ativo</span></span>
     </footer>
   </div>
 
