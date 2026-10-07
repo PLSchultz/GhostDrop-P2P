@@ -12,7 +12,8 @@ const STUN_SERVERS = {
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' }
-  ]
+  ],
+  iceCandidatePoolSize: 10
 };
 
 const MQTT_BROKERS = [
@@ -36,7 +37,7 @@ let encryptionKey = null;
 let activeSessionRoomCode = '';
 let inRoom = false;
 
-// Connected Peers Map: peerId -> { pc, dc, nickname, isInitiator, state }
+// Connected Peers Map: peerId -> { pc, dc, nickname, isInitiator, state: 'connecting'|'connected' }
 const connectedPeers = new Map();
 
 // Pending ICE Candidates queue: peerId -> [candidates]
@@ -552,7 +553,7 @@ async function startHostFlow() {
   if (!currentSignalingTopic) {
     await joinMeshRoom(rawCode, true);
   } else {
-    // Broadcast arrival to any existing peers
+    // Broadcast arrival to any peers
     sendSignalingMessage(currentSignalingTopic, {
       type: 'PEER_JOINED',
       fromPeerId: myPeerId,
@@ -612,18 +613,16 @@ async function handleSignalingMessage(msg) {
 
   // 1. PEER_JOINED: A new peer entered the room
   if (msg.type === 'PEER_JOINED') {
-    // If we were on pairing screen, automatically transition to room
     if (!inRoom) {
       enterRoom(activeSessionRoomCode);
     }
 
     // Deterministic Initiator Pattern:
     // The peer with alphabetically SMALLER peerId initiates the WebRTC offer.
-    // This avoids race conditions and collision when both peers are online.
     if (myPeerId < senderId) {
       initiatePeerConnection(senderId, senderNick);
     } else {
-      // The other peer sends a PEER_PRESENCE response so the initiator knows we are here
+      // The other peer sends a PEER_PRESENCE response so the initiator initiates
       sendSignalingMessage(currentSignalingTopic, {
         type: 'PEER_PRESENCE',
         targetPeerId: senderId,
@@ -639,7 +638,6 @@ async function handleSignalingMessage(msg) {
       enterRoom(activeSessionRoomCode);
     }
 
-    // If myPeerId < senderId, I am the initiator
     if (myPeerId < senderId && !connectedPeers.has(senderId)) {
       initiatePeerConnection(senderId, senderNick);
     }
@@ -657,8 +655,12 @@ async function handleSignalingMessage(msg) {
   else if (msg.type === 'SDP_ANSWER' && msg.targetPeerId === myPeerId) {
     const peer = connectedPeers.get(senderId);
     if (peer && peer.pc) {
-      await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-      flushPendingIceCandidates(senderId, peer.pc);
+      try {
+        await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+        await flushPendingIceCandidates(senderId, peer.pc);
+      } catch (err) {
+        console.error('Erro ao definir SDP_ANSWER remoto:', err);
+      }
     }
   }
 
@@ -667,11 +669,7 @@ async function handleSignalingMessage(msg) {
     if (msg.candidate) {
       const peer = connectedPeers.get(senderId);
       if (peer && peer.pc && peer.pc.remoteDescription && peer.pc.remoteDescription.type) {
-        try {
-          await peer.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-        } catch (err) {
-          console.warn('Erro ao adicionar ICE candidate:', err);
-        }
+        await addCandidateToPeer(peer.pc, msg.candidate);
       } else {
         // Queue candidate until remoteDescription is set
         if (!pendingIceCandidates.has(senderId)) {
@@ -683,16 +681,26 @@ async function handleSignalingMessage(msg) {
   }
 }
 
+// Safely add candidate to RTCPeerConnection
+async function addCandidateToPeer(pc, candData) {
+  if (!candData || (!candData.candidate && candData.candidate !== "")) return;
+  try {
+    if (typeof RTCIceCandidate === 'function') {
+      await pc.addIceCandidate(new RTCIceCandidate(candData));
+    } else {
+      await pc.addIceCandidate(candData);
+    }
+  } catch (err) {
+    console.warn('Info ICE candidate:', err.message);
+  }
+}
+
 // Flush Queued ICE Candidates after setRemoteDescription
 async function flushPendingIceCandidates(peerId, pc) {
   if (pendingIceCandidates.has(peerId)) {
     const candidates = pendingIceCandidates.get(peerId);
     for (const cand of candidates) {
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(cand));
-      } catch (err) {
-        console.warn('Erro ao aplicar ICE candidato enfileirado:', err);
-      }
+      await addCandidateToPeer(pc, cand);
     }
     pendingIceCandidates.delete(peerId);
   }
@@ -718,9 +726,11 @@ async function initiatePeerConnection(targetPeerId, targetNickname) {
     pc: pc,
     dc: dc,
     nickname: targetNickname,
-    isInitiator: true
+    isInitiator: true,
+    state: 'connecting'
   };
   connectedPeers.set(targetPeerId, peerObj);
+  renderParticipantsList();
 
   setupDataChannelListeners(targetPeerId, dc);
 
@@ -730,27 +740,40 @@ async function initiatePeerConnection(targetPeerId, targetNickname) {
         type: 'ICE_CANDIDATE',
         targetPeerId: targetPeerId,
         fromPeerId: myPeerId,
-        candidate: event.candidate
+        candidate: event.candidate.toJSON ? event.candidate.toJSON() : {
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          usernameFragment: event.candidate.usernameFragment
+        }
       });
     }
   };
 
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+    console.log(`[WebRTC] Peer ${targetPeerId} connectionState: ${pc.connectionState}`);
+    if (pc.connectionState === 'connected') {
+      peerObj.state = 'connected';
+      renderParticipantsList();
+    } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
       removePeer(targetPeerId);
     }
   };
 
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
 
-  sendSignalingMessage(currentSignalingTopic, {
-    type: 'SDP_OFFER',
-    targetPeerId: targetPeerId,
-    fromPeerId: myPeerId,
-    nickname: myNickname,
-    sdp: offer
-  });
+    sendSignalingMessage(currentSignalingTopic, {
+      type: 'SDP_OFFER',
+      targetPeerId: targetPeerId,
+      fromPeerId: myPeerId,
+      nickname: myNickname,
+      sdp: offer
+    });
+  } catch (err) {
+    console.error('Erro ao criar SDP_OFFER:', err);
+  }
 }
 
 // Peer B (Receiver): Handle Offer from Peer A and send Answer
@@ -771,9 +794,11 @@ async function handleIncomingOffer(fromPeerId, fromNickname, offerSdp) {
     pc: pc,
     dc: null,
     nickname: fromNickname,
-    isInitiator: false
+    isInitiator: false,
+    state: 'connecting'
   };
   connectedPeers.set(fromPeerId, peerObj);
+  renderParticipantsList();
 
   pc.ondatachannel = (event) => {
     const dc = event.channel;
@@ -788,49 +813,77 @@ async function handleIncomingOffer(fromPeerId, fromNickname, offerSdp) {
         type: 'ICE_CANDIDATE',
         targetPeerId: fromPeerId,
         fromPeerId: myPeerId,
-        candidate: event.candidate
+        candidate: event.candidate.toJSON ? event.candidate.toJSON() : {
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          usernameFragment: event.candidate.usernameFragment
+        }
       });
     }
   };
 
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+    console.log(`[WebRTC] Peer ${fromPeerId} connectionState: ${pc.connectionState}`);
+    if (pc.connectionState === 'connected') {
+      peerObj.state = 'connected';
+      renderParticipantsList();
+    } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
       removePeer(fromPeerId);
     }
   };
 
-  await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
-  flushPendingIceCandidates(fromPeerId, pc);
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
+    await flushPendingIceCandidates(fromPeerId, pc);
 
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
 
-  sendSignalingMessage(currentSignalingTopic, {
-    type: 'SDP_ANSWER',
-    targetPeerId: fromPeerId,
-    fromPeerId: myPeerId,
-    nickname: myNickname,
-    sdp: answer
-  });
+    sendSignalingMessage(currentSignalingTopic, {
+      type: 'SDP_ANSWER',
+      targetPeerId: fromPeerId,
+      fromPeerId: myPeerId,
+      nickname: myNickname,
+      sdp: answer
+    });
+  } catch (err) {
+    console.error('Erro ao processar oferta ou criar SDP_ANSWER:', err);
+  }
 }
 
-// Setup DataChannel Listeners for a Specific Peer
+// Setup DataChannel Listeners with immediate readyState check
 function setupDataChannelListeners(peerId, channel) {
-  channel.onopen = () => {
-    // Send my info to this peer
-    channel.send(JSON.stringify({
-      type: 'PEER_INFO',
-      peerId: myPeerId,
-      nickname: myNickname
-    }));
-
+  function handleOpen() {
+    console.log('[WebRTC] DataChannel aberto com sucesso para peer:', peerId);
     const peer = connectedPeers.get(peerId);
+    if (peer) {
+      peer.state = 'connected';
+      peer.dc = channel;
+    }
+
+    // Send my info to this peer
+    try {
+      channel.send(JSON.stringify({
+        type: 'PEER_INFO',
+        peerId: myPeerId,
+        nickname: myNickname
+      }));
+    } catch (e) {}
+
     const peerNick = peer ? peer.nickname : 'Participante';
     appendSystemMessage(`👤 <strong>${escapeHtml(peerNick)}</strong> conectou-se à sala.`);
     renderParticipantsList();
-  };
+  }
+
+  if (channel.readyState === 'open') {
+    handleOpen();
+  } else {
+    channel.onopen = handleOpen;
+  }
 
   channel.onclose = () => {
+    console.log('[WebRTC] DataChannel fechado para peer:', peerId);
     removePeer(peerId);
   };
 
@@ -957,7 +1010,9 @@ async function handleDataChannelMessage(fromPeerId, event) {
 function removePeer(peerId) {
   const peer = connectedPeers.get(peerId);
   if (peer) {
-    appendSystemMessage(`🚪 <strong>${escapeHtml(peer.nickname)}</strong> desconectou-se da sala.`);
+    if (peer.state === 'connected') {
+      appendSystemMessage(`🚪 <strong>${escapeHtml(peer.nickname)}</strong> desconectou-se da sala.`);
+    }
     try {
       if (peer.dc) peer.dc.close();
       if (peer.pc) peer.pc.close();
@@ -1052,8 +1107,8 @@ function leaveRoom() {
 
 // Render Participants List & Counter
 function renderParticipantsList() {
-  const count = connectedPeers.size + 1; // +1 for self
-  participantCountText.textContent = count === 1 ? '1 participante (você)' : `${count} participantes`;
+  const activeCount = Array.from(connectedPeers.values()).filter(p => p.state === 'connected').length + 1;
+  participantCountText.textContent = activeCount === 1 ? '1 participante (você)' : `${activeCount} participantes`;
 
   participantsChips.innerHTML = '';
 
@@ -1066,13 +1121,14 @@ function renderParticipantsList() {
   `;
   participantsChips.appendChild(myChip);
 
-  // 2. Add Connected Peers
+  // 2. Add Connected/Connecting Peers
   connectedPeers.forEach(peer => {
+    const isConn = peer.state === 'connected';
     const chip = document.createElement('div');
     chip.className = 'peer-chip';
     chip.innerHTML = `
       <span class="peer-chip-avatar" style="background:${getNicknameColor(peer.nickname)};"></span>
-      <span>${escapeHtml(peer.nickname)}</span>
+      <span>${escapeHtml(peer.nickname)} ${isConn ? '' : '<small style="opacity:0.6;">(conectando...)</small>'}</span>
     `;
     participantsChips.appendChild(chip);
   });
@@ -1169,7 +1225,8 @@ function updateTypingIndicatorUI() {
 
 // Queue Files to Send to Connected Peers
 function queueFilesToSend(files) {
-  if (connectedPeers.size === 0) {
+  const connectedCount = Array.from(connectedPeers.values()).filter(p => p.state === 'connected').length;
+  if (connectedCount === 0) {
     alert('Nenhum outro participante conectado na sala ainda. Compartilhe o código ou link da sala para que outras pessoas entrem!');
     return;
   }
