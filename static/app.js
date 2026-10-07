@@ -3,12 +3,14 @@
  * Real-time Group Chat & End-to-End Encrypted File Transfer
  */
 
-// WebRTC Configuration
+// WebRTC STUN Configuration
 const STUN_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' }
   ]
 };
@@ -18,7 +20,7 @@ const MQTT_BROKERS = [
   'wss://broker.hivemq.com:8884/mqtt'
 ];
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk for WebRTC DataChannel
+const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
 const BUFFER_THRESHOLD = 2 * 1024 * 1024; // 2 MB backpressure threshold
 
 // Local Identity State
@@ -32,9 +34,13 @@ let mqttClient = null;
 let currentSignalingTopic = '';
 let encryptionKey = null;
 let activeSessionRoomCode = '';
+let inRoom = false;
 
-// Connected Peers in Mesh Map: peerId -> { pc, dc, nickname, state }
+// Connected Peers Map: peerId -> { pc, dc, nickname, isInitiator, state }
 const connectedPeers = new Map();
+
+// Pending ICE Candidates queue: peerId -> [candidates]
+const pendingIceCandidates = new Map();
 
 // Session transfers history
 let sessionTransfers = [];
@@ -50,7 +56,7 @@ let lastBytes = 0;
 let lastTime = 0;
 
 // Typing indicator state
-const typingPeers = new Map(); // peerId -> timeoutId
+const typingPeers = new Map(); // peerId -> { timeout, nickname }
 
 // DOM Elements
 const pairingSection = document.getElementById('pairingSection');
@@ -126,7 +132,13 @@ document.addEventListener('DOMContentLoaded', () => {
   initNickname();
   setupEventListeners();
   generatePairingCode();
-  checkUrlParams();
+  
+  // Check if URL has ?receive=XXXXXX
+  const hasParam = checkUrlParams();
+  if (!hasParam) {
+    // Start listening on host room signaling immediately so anyone who joins is detected
+    initHostSignaling(pairingCode);
+  }
 });
 
 // Nickname Management
@@ -211,7 +223,7 @@ function generatePairingCode() {
 }
 
 function cleanCode(code) {
-  return code.replace(/[^0-9]/g, '');
+  return String(code).replace(/[^0-9]/g, '');
 }
 
 function formatCode(digits) {
@@ -246,8 +258,10 @@ function checkUrlParams() {
     receiveCodeInput.value = formatCode(cleanCode(code));
     setTimeout(() => {
       startReceiverFlow();
-    }, 400);
+    }, 300);
+    return true;
   }
+  return false;
 }
 
 // Cryptography: Derive AES-256 Key from Room Code
@@ -521,14 +535,30 @@ function setupEventListeners() {
 }
 
 // =========================================================================
-// MULTI-PEER WEBRTC MESH & SIGNALING
+// MULTI-PEER WEBRTC MESH & SIGNALING PROTOCOL
 // =========================================================================
 
-// Start Host Room
+// Initialize background signaling for Host pairing code
+async function initHostSignaling(code) {
+  const rawCode = cleanCode(code);
+  activeSessionRoomCode = formatCode(rawCode);
+  await joinMeshRoom(rawCode, false);
+}
+
+// User explicitly clicks "Abrir Sala Agora"
 async function startHostFlow() {
   const rawCode = cleanCode(pairingCode);
   activeSessionRoomCode = formatCode(rawCode);
-  await joinMeshRoom(rawCode);
+  if (!currentSignalingTopic) {
+    await joinMeshRoom(rawCode, true);
+  } else {
+    // Broadcast arrival to any existing peers
+    sendSignalingMessage(currentSignalingTopic, {
+      type: 'PEER_JOINED',
+      fromPeerId: myPeerId,
+      nickname: myNickname
+    });
+  }
   enterRoom(activeSessionRoomCode);
 }
 
@@ -544,12 +574,12 @@ async function startReceiverFlow() {
   receiverStatusText.textContent = 'Conectando à sala...';
   activeSessionRoomCode = formatCode(codeVal);
 
-  await joinMeshRoom(codeVal);
+  await joinMeshRoom(codeVal, true);
   enterRoom(activeSessionRoomCode);
 }
 
 // Join Mesh Room over encrypted MQTT
-async function joinMeshRoom(rawCode) {
+async function joinMeshRoom(rawCode, announceNow = true) {
   encryptionKey = await deriveKey(rawCode);
   currentSignalingTopic = `ghostdrop/p2p/${rawCode}`;
 
@@ -559,12 +589,14 @@ async function joinMeshRoom(rawCode) {
       if (!decrypted) return;
       handleSignalingMessage(decrypted);
     }, () => {
-      // Announce arrival to all peers in room
-      sendSignalingMessage(currentSignalingTopic, {
-        type: 'PEER_JOINED',
-        fromPeerId: myPeerId,
-        nickname: myNickname
-      });
+      if (announceNow) {
+        // Announce presence to all peers in room
+        sendSignalingMessage(currentSignalingTopic, {
+          type: 'PEER_JOINED',
+          fromPeerId: myPeerId,
+          nickname: myNickname
+        });
+      }
       resolve();
     });
   });
@@ -578,41 +610,106 @@ async function handleSignalingMessage(msg) {
   const senderId = msg.fromPeerId;
   const senderNick = msg.nickname || 'Ghost Peer';
 
-  // 1. New peer joined the room: As an existing peer, we initiate the WebRTC connection to the newcomer
+  // 1. PEER_JOINED: A new peer entered the room
   if (msg.type === 'PEER_JOINED') {
-    if (!connectedPeers.has(senderId)) {
+    // If we were on pairing screen, automatically transition to room
+    if (!inRoom) {
+      enterRoom(activeSessionRoomCode);
+    }
+
+    // Deterministic Initiator Pattern:
+    // The peer with alphabetically SMALLER peerId initiates the WebRTC offer.
+    // This avoids race conditions and collision when both peers are online.
+    if (myPeerId < senderId) {
+      initiatePeerConnection(senderId, senderNick);
+    } else {
+      // The other peer sends a PEER_PRESENCE response so the initiator knows we are here
+      sendSignalingMessage(currentSignalingTopic, {
+        type: 'PEER_PRESENCE',
+        targetPeerId: senderId,
+        fromPeerId: myPeerId,
+        nickname: myNickname
+      });
+    }
+  }
+
+  // 2. PEER_PRESENCE: A peer is responding to our PEER_JOINED
+  else if (msg.type === 'PEER_PRESENCE' && msg.targetPeerId === myPeerId) {
+    if (!inRoom) {
+      enterRoom(activeSessionRoomCode);
+    }
+
+    // If myPeerId < senderId, I am the initiator
+    if (myPeerId < senderId && !connectedPeers.has(senderId)) {
       initiatePeerConnection(senderId, senderNick);
     }
   }
 
-  // 2. Received WebRTC SDP Offer (only process if targeted to me)
+  // 3. SDP_OFFER: Targeted offer received
   else if (msg.type === 'SDP_OFFER' && msg.targetPeerId === myPeerId) {
+    if (!inRoom) {
+      enterRoom(activeSessionRoomCode);
+    }
     handleIncomingOffer(senderId, senderNick, msg.sdp);
   }
 
-  // 3. Received WebRTC SDP Answer (only process if targeted to me)
+  // 4. SDP_ANSWER: Targeted answer received
   else if (msg.type === 'SDP_ANSWER' && msg.targetPeerId === myPeerId) {
     const peer = connectedPeers.get(senderId);
     if (peer && peer.pc) {
       await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      flushPendingIceCandidates(senderId, peer.pc);
     }
   }
 
-  // 4. Received ICE Candidate (only process if targeted to me)
+  // 5. ICE_CANDIDATE: Targeted ICE candidate received
   else if (msg.type === 'ICE_CANDIDATE' && msg.targetPeerId === myPeerId) {
-    const peer = connectedPeers.get(senderId);
-    if (peer && peer.pc && msg.candidate) {
-      try {
-        await peer.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-      } catch (err) {
-        console.warn('Erro ao adicionar ICE candidate:', err);
+    if (msg.candidate) {
+      const peer = connectedPeers.get(senderId);
+      if (peer && peer.pc && peer.pc.remoteDescription && peer.pc.remoteDescription.type) {
+        try {
+          await peer.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
+        } catch (err) {
+          console.warn('Erro ao adicionar ICE candidate:', err);
+        }
+      } else {
+        // Queue candidate until remoteDescription is set
+        if (!pendingIceCandidates.has(senderId)) {
+          pendingIceCandidates.set(senderId, []);
+        }
+        pendingIceCandidates.get(senderId).push(msg.candidate);
       }
     }
   }
 }
 
-// Peer A (Initiator): Create PeerConnection and send Offer to Peer B
+// Flush Queued ICE Candidates after setRemoteDescription
+async function flushPendingIceCandidates(peerId, pc) {
+  if (pendingIceCandidates.has(peerId)) {
+    const candidates = pendingIceCandidates.get(peerId);
+    for (const cand of candidates) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(cand));
+      } catch (err) {
+        console.warn('Erro ao aplicar ICE candidato enfileirado:', err);
+      }
+    }
+    pendingIceCandidates.delete(peerId);
+  }
+}
+
+// Peer A (Initiator): Create PeerConnection, DataChannel, and send Offer to Peer B
 async function initiatePeerConnection(targetPeerId, targetNickname) {
+  // Clean up any stale connection
+  if (connectedPeers.has(targetPeerId)) {
+    try {
+      const old = connectedPeers.get(targetPeerId);
+      if (old.dc) old.dc.close();
+      if (old.pc) old.pc.close();
+    } catch (e) {}
+    connectedPeers.delete(targetPeerId);
+  }
+
   const pc = new RTCPeerConnection(STUN_SERVERS);
   const dc = pc.createDataChannel('ghostdropChannel', { ordered: true });
   dc.binaryType = 'arraybuffer';
@@ -658,6 +755,16 @@ async function initiatePeerConnection(targetPeerId, targetNickname) {
 
 // Peer B (Receiver): Handle Offer from Peer A and send Answer
 async function handleIncomingOffer(fromPeerId, fromNickname, offerSdp) {
+  // Clean up any stale connection
+  if (connectedPeers.has(fromPeerId)) {
+    try {
+      const old = connectedPeers.get(fromPeerId);
+      if (old.dc) old.dc.close();
+      if (old.pc) old.pc.close();
+    } catch (e) {}
+    connectedPeers.delete(fromPeerId);
+  }
+
   const pc = new RTCPeerConnection(STUN_SERVERS);
 
   const peerObj = {
@@ -693,6 +800,8 @@ async function handleIncomingOffer(fromPeerId, fromNickname, offerSdp) {
   };
 
   await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
+  flushPendingIceCandidates(fromPeerId, pc);
+
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
 
@@ -854,6 +963,7 @@ function removePeer(peerId) {
       if (peer.pc) peer.pc.close();
     } catch (e) {}
     connectedPeers.delete(peerId);
+    pendingIceCandidates.delete(peerId);
     renderParticipantsList();
   }
 }
@@ -911,6 +1021,7 @@ async function sendSignalingMessage(topic, data) {
 
 // UI Transition: Enter Connected Room
 function enterRoom(code) {
+  inRoom = true;
   pairingSection.classList.add('hidden');
   activeRoomSection.classList.remove('hidden');
   activeRoomCode.textContent = `#${code}`;
@@ -922,6 +1033,7 @@ function enterRoom(code) {
 
 // UI Transition: Leave Room
 function leaveRoom() {
+  inRoom = false;
   resetAllConnections();
   activeRoomSection.classList.add('hidden');
   pairingSection.classList.remove('hidden');
@@ -935,6 +1047,7 @@ function leaveRoom() {
   sessionTransfers = [];
   renderTransfersList();
   generatePairingCode();
+  initHostSignaling(pairingCode);
 }
 
 // Render Participants List & Counter
@@ -1027,7 +1140,7 @@ function appendSystemMessage(htmlText) {
 function handlePeerTyping(peerId, nickname, isTyping) {
   if (isTyping) {
     if (typingPeers.has(peerId)) {
-      clearTimeout(typingPeers.get(peerId));
+      clearTimeout(typingPeers.get(peerId).timeout);
     }
     const timeout = setTimeout(() => {
       typingPeers.delete(peerId);
@@ -1262,6 +1375,7 @@ function resetAllConnections() {
     } catch (e) {}
   });
   connectedPeers.clear();
+  pendingIceCandidates.clear();
 
   if (mqttClient) {
     mqttClient.end();
