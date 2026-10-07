@@ -64,13 +64,9 @@
     <!-- BEFORE CONNECTION: Navigation Tabs -->
     <div id="pairingSection">
       <nav class="nav-tabs">
-        <button class="tab-btn active" id="tabSendBtn" onclick="switchTab('send')">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13"></path><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-          Criar Sala Multi-Peer
-        </button>
-        <button class="tab-btn" id="tabReceiveBtn" onclick="switchTab('receive')">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
-          Entrar com Código
+        <button class="tab-btn active" id="tabConnectBtn" onclick="switchTab('connect')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><polyline points="10 17 15 12 10 7"></polyline><line x1="15" y1="12" x2="3" y2="12"></line></svg>
+          Conectar à Sala
         </button>
         <button class="tab-btn" id="tabSecurityBtn" onclick="switchTab('security')">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
@@ -81,85 +77,48 @@
       <!-- Main Pairing Card -->
       <main class="main-card">
         
-        <!-- TAB 1: HOST / CREATE ROOM -->
-        <section id="tabSend" class="tab-content active">
-          <div class="host-hero">
-            <div class="pairing-title">
-              <span class="step-badge">1</span>
-              <span>Código da sua Sala (Qualquer pessoa pode se juntar):</span>
-            </div>
-            
-            <div class="code-display-wrap">
-              <div class="code-display" id="senderPairingCode">------</div>
-              <button class="btn-action" id="copyCodeBtn" title="Copiar Código">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
-                Copiar
-              </button>
-              <button class="btn-action secondary" id="copyLinkBtn" title="Copiar Link de Convite Direto">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
-                Link
-              </button>
-              <button class="btn-action secondary" id="showQrBtn" title="Exibir QR Code">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
-                QR Code
-              </button>
-            </div>
-
-            <div class="qr-modal-container hidden" id="qrContainer">
-              <div id="qrcode"></div>
-              <p class="qr-hint">Aponte a câmera para parear instantaneamente</p>
-            </div>
-
-            <div class="start-room-action-row">
-              <button id="btnEnterCreatedRoom" class="btn-primary-large">
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><polyline points="10 17 15 12 10 7"></polyline><line x1="15" y1="12" x2="3" y2="12"></line></svg>
-                Abrir Sala Agora
-              </button>
-            </div>
-
-            <div class="status-banner" id="senderStatusBanner">
-              <div class="pulse-indicator"></div>
-              <span id="senderStatusText">Aguardando participantes entrarem com o código...</span>
-            </div>
-
-            <div class="quick-tips-box">
-              <p>👥 <strong>Suporte Multi-Peer:</strong> Múltiplas pessoas podem se conectar à mesma sala simultaneamente via malha direta WebRTC (Mesh). Todos no grupo podem conversar em tempo real com apelidos visíveis e trocar arquivos sem servidores intermediários!</p>
-            </div>
-          </div>
-        </section>
-
-        <!-- TAB 2: JOIN / ENTER CODE -->
-        <section id="tabReceive" class="tab-content">
-          <div class="receive-hero">
+        <!-- UNIFIED TAB: CONNECT / ENTER ANY CODE OR GENERATE -->
+        <section id="tabConnect" class="tab-content active">
+          <div class="unified-hero">
             <div class="receive-icon-wrap">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                <polyline points="7 10 12 15 17 10"></polyline>
-                <line x1="12" y1="15" x2="12" y2="3"></line>
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="2" y1="12" x2="22" y2="12"></line>
+                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
               </svg>
             </div>
-            <h2>Entrar em uma Sala Multi-Peer</h2>
-            <p>Digite o código de 6 dígitos gerado pela sala para entrar no grupo P2P.</p>
+            <h2>Sala P2P Sincronizada</h2>
+            <p>Basta você e seus parceiros inserirem o <strong>mesmo código</strong> para sincronizarem instantaneamente no chat e troca de arquivos.</p>
           </div>
 
-          <div class="receive-input-box">
-            <label for="receiveCodeInput" class="input-label">Código da Sala:</label>
-            <div class="code-input-row">
-              <input type="text" id="receiveCodeInput" maxlength="7" placeholder="Ex: 849-210" autocomplete="off" spellcheck="false">
-              <button id="btnConnectReceiver" class="btn-primary">
+          <div class="unified-box">
+            <div class="input-group-row">
+              <label for="roomCodeInput" class="input-label">Código da Sala:</label>
+              <button type="button" id="btnGenerateRandomCode" class="btn-text-action" title="Gerar um novo código aleatório">
+                🎲 Gerar Código Aleatório
+              </button>
+            </div>
+
+            <div class="code-entry-row">
+              <input type="text" id="roomCodeInput" maxlength="7" placeholder="Ex: 849-210" autocomplete="off" spellcheck="false">
+              <button id="btnEnterRoom" class="btn-primary-large">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
                 Entrar na Sala
               </button>
             </div>
 
-            <div class="status-banner hidden" id="receiverStatusBanner">
-              <div class="pulse-indicator" id="receiverPulse"></div>
-              <span id="receiverStatusText">Conectando à sala...</span>
+            <div class="status-banner hidden" id="connectStatusBanner">
+              <div class="pulse-indicator"></div>
+              <span id="connectStatusText">Conectando à rede P2P...</span>
+            </div>
+
+            <div class="quick-tips-box" style="margin-top:20px;">
+              <p>💡 <strong>Como funciona:</strong> Qualquer pessoa que digitar este mesmo código (ou acessar o link gerado dentro da sala) será conectada diretamente à sua sessão P2P. Não há limites de pessoas nem intermediários.</p>
             </div>
           </div>
         </section>
 
-        <!-- TAB 3: SECURITY -->
+        <!-- TAB 2: SECURITY -->
         <section id="tabSecurity" class="tab-content">
           <div class="security-grid">
             <div class="sec-card">
@@ -197,7 +156,7 @@
         <div class="room-left-info">
           <div class="room-peer-badge">
             <span class="status-dot green pulse"></span>
-            <span>Sala Multi-Peer</span>
+            <span>Sala</span>
             <span class="room-code-tag" id="activeRoomCode" title="Código da sala">#000-000</span>
           </div>
 
@@ -217,11 +176,21 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
             Convidar Link
           </button>
+          <button id="btnRoomQrCode" class="btn-action-small" title="Exibir QR Code">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+            QR Code
+          </button>
           <button id="btnDisconnect" class="btn-disconnect" title="Sair desta sala">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
             Sair da Sala
           </button>
         </div>
+      </div>
+
+      <!-- QR Modal (inside room) -->
+      <div class="qr-modal-container hidden" id="qrContainer" style="margin: 8px 0;">
+        <div id="qrcode"></div>
+        <p class="qr-hint">Aponte a câmera para parear instantaneamente nesta sala</p>
       </div>
 
       <!-- Connected Participants Bar -->

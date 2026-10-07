@@ -1,5 +1,5 @@
 /**
- * GhostDrop P2P v2.0 - Decentralized Multi-Peer WebRTC Mesh Engine
+ * GhostDrop P2P v2.0 - Synchronized Multi-Peer WebRTC Mesh Engine
  * Real-time Group Chat & End-to-End Encrypted File Transfer
  */
 
@@ -25,19 +25,19 @@ const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
 const BUFFER_THRESHOLD = 2 * 1024 * 1024; // 2 MB backpressure threshold
 
 // Local Identity State
-const myPeerId = 'peer_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
+const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
 let myNickname = '';
 
 // Application State
-let currentTab = 'send';
-let pairingCode = '';
+let currentTab = 'connect';
 let mqttClient = null;
 let currentSignalingTopic = '';
 let encryptionKey = null;
 let activeSessionRoomCode = '';
+let heartbeatTimer = null;
 let inRoom = false;
 
-// Connected Peers Map: peerId -> { pc, dc, nickname, isInitiator, state: 'connecting'|'connected' }
+// Connected Peers Map: peerId -> { pc, dc, nickname, isPolite, state: 'connecting'|'connected' }
 const connectedPeers = new Map();
 
 // Pending ICE Candidates queue: peerId -> [candidates]
@@ -68,27 +68,20 @@ const participantsChips = document.getElementById('participantsChips');
 const btnDisconnect = document.getElementById('btnDisconnect');
 const btnRoomCopyCode = document.getElementById('btnRoomCopyCode');
 const btnRoomCopyLink = document.getElementById('btnRoomCopyLink');
+const btnRoomQrCode = document.getElementById('btnRoomQrCode');
+const qrContainer = document.getElementById('qrContainer');
 
-const tabSend = document.getElementById('tabSend');
-const tabReceive = document.getElementById('tabReceive');
+const tabConnect = document.getElementById('tabConnect');
 const tabSecurity = document.getElementById('tabSecurity');
-const tabSendBtn = document.getElementById('tabSendBtn');
-const tabReceiveBtn = document.getElementById('tabReceiveBtn');
+const tabConnectBtn = document.getElementById('tabConnectBtn');
 const tabSecurityBtn = document.getElementById('tabSecurityBtn');
 
 const globalNicknameInput = document.getElementById('globalNicknameInput');
-const senderPairingCode = document.getElementById('senderPairingCode');
-const copyCodeBtn = document.getElementById('copyCodeBtn');
-const copyLinkBtn = document.getElementById('copyLinkBtn');
-const showQrBtn = document.getElementById('showQrBtn');
-const qrContainer = document.getElementById('qrContainer');
-const senderStatusText = document.getElementById('senderStatusText');
-const btnEnterCreatedRoom = document.getElementById('btnEnterCreatedRoom');
-
-const receiveCodeInput = document.getElementById('receiveCodeInput');
-const btnConnectReceiver = document.getElementById('btnConnectReceiver');
-const receiverStatusBanner = document.getElementById('receiverStatusBanner');
-const receiverStatusText = document.getElementById('receiverStatusText');
+const roomCodeInput = document.getElementById('roomCodeInput');
+const btnGenerateRandomCode = document.getElementById('btnGenerateRandomCode');
+const btnEnterRoom = document.getElementById('btnEnterRoom');
+const connectStatusBanner = document.getElementById('connectStatusBanner');
+const connectStatusText = document.getElementById('connectStatusText');
 
 const statusDot = document.getElementById('statusDot');
 const statusPillText = document.getElementById('statusPillText');
@@ -132,14 +125,12 @@ const btnModalReject = document.getElementById('btnModalReject');
 document.addEventListener('DOMContentLoaded', () => {
   initNickname();
   setupEventListeners();
-  generatePairingCode();
-  
-  // Check if URL has ?receive=XXXXXX
-  const hasParam = checkUrlParams();
-  if (!hasParam) {
-    // Start listening on host room signaling immediately so anyone who joins is detected
-    initHostSignaling(pairingCode);
-  }
+
+  // Generate initial code into input
+  roomCodeInput.value = generateRandomCode();
+
+  // Check if URL has ?room=... or ?receive=...
+  checkUrlParams();
 });
 
 // Nickname Management
@@ -212,15 +203,11 @@ function formatTime() {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-// Generate a random 6-digit room code
-function generatePairingCode() {
+// Generate random 6-digit code
+function generateRandomCode() {
   const num1 = Math.floor(100 + Math.random() * 900);
   const num2 = Math.floor(100 + Math.random() * 900);
-  pairingCode = `${num1}-${num2}`;
-  if (senderPairingCode) {
-    senderPairingCode.textContent = pairingCode;
-  }
-  return pairingCode;
+  return `${num1}-${num2}`;
 }
 
 function cleanCode(code) {
@@ -228,38 +215,35 @@ function cleanCode(code) {
 }
 
 function formatCode(digits) {
-  if (digits.length <= 3) return digits;
-  return digits.slice(0, 3) + '-' + digits.slice(3, 6);
+  const clean = cleanCode(digits);
+  if (clean.length <= 3) return clean;
+  return clean.slice(0, 3) + '-' + clean.slice(3, 6);
 }
 
 // Tab Switching
 function switchTab(tab) {
   currentTab = tab;
-  [tabSend, tabReceive, tabSecurity].forEach(el => el.classList.remove('active'));
-  [tabSendBtn, tabReceiveBtn, tabSecurityBtn].forEach(el => el.classList.remove('active'));
+  [tabConnect, tabSecurity].forEach(el => el.classList.remove('active'));
+  [tabConnectBtn, tabSecurityBtn].forEach(el => el.classList.remove('active'));
 
-  if (tab === 'send') {
-    tabSend.classList.add('active');
-    tabSendBtn.classList.add('active');
-  } else if (tab === 'receive') {
-    tabReceive.classList.add('active');
-    tabReceiveBtn.classList.add('active');
+  if (tab === 'connect') {
+    tabConnect.classList.add('active');
+    tabConnectBtn.classList.add('active');
   } else if (tab === 'security') {
     tabSecurity.classList.add('active');
     tabSecurityBtn.classList.add('active');
   }
 }
 
-// Check URL Query Parameters (e.g., ?receive=849210)
+// Check URL Query Parameters (e.g., ?room=849210 or ?receive=849210)
 function checkUrlParams() {
   const params = new URLSearchParams(window.location.search);
-  const code = params.get('receive');
+  const code = params.get('room') || params.get('receive');
   if (code) {
-    switchTab('receive');
-    receiveCodeInput.value = formatCode(cleanCode(code));
+    roomCodeInput.value = formatCode(code);
     setTimeout(() => {
-      startReceiverFlow();
-    }, 300);
+      enterSelectedRoom();
+    }, 200);
     return true;
   }
   return false;
@@ -278,7 +262,7 @@ async function deriveKey(code) {
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
-      salt: enc.encode('ghostdrop_p2p_multi_mesh_salt_2026'),
+      salt: enc.encode('ghostdrop_p2p_unified_mesh_2026'),
       iterations: 50000,
       hash: 'SHA-256'
     },
@@ -318,7 +302,6 @@ async function decryptPayload(key, encrypted) {
     const dec = new TextDecoder();
     return JSON.parse(dec.decode(decrypted));
   } catch (err) {
-    console.error('Falha na decriptação de sinalização:', err);
     return null;
   }
 }
@@ -340,63 +323,25 @@ function setupEventListeners() {
     updateNickname(e.target.value);
   });
 
-  // Copy Code
-  copyCodeBtn.addEventListener('click', () => {
-    navigator.clipboard.writeText(pairingCode).then(() => {
-      const orig = copyCodeBtn.innerHTML;
-      copyCodeBtn.innerHTML = '<span>✓ Copiado!</span>';
-      setTimeout(() => { copyCodeBtn.innerHTML = orig; }, 2000);
-    });
+  // Generate random code button
+  btnGenerateRandomCode.addEventListener('click', () => {
+    roomCodeInput.value = generateRandomCode();
   });
 
-  // Copy Link
-  copyLinkBtn.addEventListener('click', () => {
-    const url = `${window.location.origin}/?receive=${cleanCode(pairingCode)}`;
-    navigator.clipboard.writeText(url).then(() => {
-      const orig = copyLinkBtn.innerHTML;
-      copyLinkBtn.innerHTML = '<span>✓ Link Copiado!</span>';
-      setTimeout(() => { copyLinkBtn.innerHTML = orig; }, 2000);
-    });
+  // Room input formatter
+  roomCodeInput.addEventListener('input', (e) => {
+    e.target.value = formatCode(e.target.value);
   });
 
-  // Show QR code
-  showQrBtn.addEventListener('click', () => {
-    const isHidden = qrContainer.classList.toggle('hidden');
-    if (!isHidden) {
-      const qrEl = document.getElementById('qrcode');
-      qrEl.innerHTML = '';
-      const url = `${window.location.origin}/?receive=${cleanCode(pairingCode)}`;
-      new QRCode(qrEl, {
-        text: url,
-        width: 180,
-        height: 180,
-        colorDark: "#000000",
-        colorLight: "#ffffff",
-        correctLevel: QRCode.CorrectLevel.M
-      });
-    }
-  });
-
-  // Open Created Room Button
-  btnEnterCreatedRoom.addEventListener('click', () => {
-    startHostFlow();
-  });
-
-  // Receiver Input Formatter
-  receiveCodeInput.addEventListener('input', (e) => {
-    const raw = cleanCode(e.target.value);
-    e.target.value = formatCode(raw);
-  });
-
-  receiveCodeInput.addEventListener('keypress', (e) => {
+  roomCodeInput.addEventListener('keypress', (e) => {
     if (e.key === 'Enter') {
-      startReceiverFlow();
+      enterSelectedRoom();
     }
   });
 
-  btnConnectReceiver.addEventListener('click', startReceiverFlow);
+  btnEnterRoom.addEventListener('click', enterSelectedRoom);
 
-  // Room Actions (In Room)
+  // In-Room Copy Code
   btnRoomCopyCode.addEventListener('click', () => {
     navigator.clipboard.writeText(activeSessionRoomCode).then(() => {
       const orig = btnRoomCopyCode.innerHTML;
@@ -405,13 +350,32 @@ function setupEventListeners() {
     });
   });
 
+  // In-Room Copy Link
   btnRoomCopyLink.addEventListener('click', () => {
-    const url = `${window.location.origin}/?receive=${cleanCode(activeSessionRoomCode)}`;
+    const url = `${window.location.origin}/?room=${cleanCode(activeSessionRoomCode)}`;
     navigator.clipboard.writeText(url).then(() => {
       const orig = btnRoomCopyLink.innerHTML;
       btnRoomCopyLink.innerHTML = '<span>✓ Link Copiado!</span>';
       setTimeout(() => { btnRoomCopyLink.innerHTML = orig; }, 2000);
     });
+  });
+
+  // In-Room QR Code
+  btnRoomQrCode.addEventListener('click', () => {
+    const isHidden = qrContainer.classList.toggle('hidden');
+    if (!isHidden) {
+      const qrEl = document.getElementById('qrcode');
+      qrEl.innerHTML = '';
+      const url = `${window.location.origin}/?room=${cleanCode(activeSessionRoomCode)}`;
+      new QRCode(qrEl, {
+        text: url,
+        width: 160,
+        height: 160,
+        colorDark: "#000000",
+        colorLight: "#ffffff",
+        correctLevel: QRCode.CorrectLevel.M
+      });
+    }
   });
 
   // Chat Form
@@ -536,53 +500,29 @@ function setupEventListeners() {
 }
 
 // =========================================================================
-// MULTI-PEER WEBRTC MESH & SIGNALING PROTOCOL
+// SYNCHRONIZED MULTI-PEER SIGNALING & WEBRTC MESH
 // =========================================================================
 
-// Initialize background signaling for Host pairing code
-async function initHostSignaling(code) {
-  const rawCode = cleanCode(code);
-  activeSessionRoomCode = formatCode(rawCode);
-  await joinMeshRoom(rawCode, false);
-}
-
-// User explicitly clicks "Abrir Sala Agora"
-async function startHostFlow() {
-  const rawCode = cleanCode(pairingCode);
-  activeSessionRoomCode = formatCode(rawCode);
-  if (!currentSignalingTopic) {
-    await joinMeshRoom(rawCode, true);
-  } else {
-    // Broadcast arrival to any peers
-    sendSignalingMessage(currentSignalingTopic, {
-      type: 'PEER_JOINED',
-      fromPeerId: myPeerId,
-      nickname: myNickname
-    });
-  }
-  enterRoom(activeSessionRoomCode);
-}
-
-// Start Receiver Flow
-async function startReceiverFlow() {
-  const codeVal = cleanCode(receiveCodeInput.value);
-  if (codeVal.length < 6) {
+// Enter Selected Room
+async function enterSelectedRoom() {
+  const rawCode = cleanCode(roomCodeInput.value);
+  if (rawCode.length < 6) {
     alert('Digite um código de 6 dígitos válido.');
     return;
   }
 
-  receiverStatusBanner.classList.remove('hidden');
-  receiverStatusText.textContent = 'Conectando à sala...';
-  activeSessionRoomCode = formatCode(codeVal);
+  connectStatusBanner.classList.remove('hidden');
+  connectStatusText.textContent = 'Conectando à rede da sala #' + formatCode(rawCode) + '...';
+  activeSessionRoomCode = formatCode(rawCode);
 
-  await joinMeshRoom(codeVal, true);
-  enterRoom(activeSessionRoomCode);
+  await joinMeshRoom(rawCode);
+  enterRoomUI(activeSessionRoomCode);
 }
 
 // Join Mesh Room over encrypted MQTT
-async function joinMeshRoom(rawCode, announceNow = true) {
+async function joinMeshRoom(rawCode) {
   encryptionKey = await deriveKey(rawCode);
-  currentSignalingTopic = `ghostdrop/p2p/${rawCode}`;
+  currentSignalingTopic = `ghostdrop/room/${rawCode}`;
 
   return new Promise((resolve) => {
     connectSignaling(currentSignalingTopic, async (message) => {
@@ -590,14 +530,25 @@ async function joinMeshRoom(rawCode, announceNow = true) {
       if (!decrypted) return;
       handleSignalingMessage(decrypted);
     }, () => {
-      if (announceNow) {
-        // Announce presence to all peers in room
-        sendSignalingMessage(currentSignalingTopic, {
-          type: 'PEER_JOINED',
-          fromPeerId: myPeerId,
-          nickname: myNickname
-        });
-      }
+      // Announce arrival immediately
+      sendSignalingMessage(currentSignalingTopic, {
+        type: 'PEER_HELLO',
+        fromPeerId: myPeerId,
+        nickname: myNickname
+      });
+
+      // Start recurring presence broadcast every 4s to catch any latecomers
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = setInterval(() => {
+        if (inRoom) {
+          sendSignalingMessage(currentSignalingTopic, {
+            type: 'PEER_HEARTBEAT',
+            fromPeerId: myPeerId,
+            nickname: myNickname
+          });
+        }
+      }, 4000);
+
       resolve();
     });
   });
@@ -605,53 +556,24 @@ async function joinMeshRoom(rawCode, announceNow = true) {
 
 // Handle Incoming Signaling Messages in Mesh
 async function handleSignalingMessage(msg) {
-  // Ignore own announcements
   if (msg.fromPeerId === myPeerId) return;
 
   const senderId = msg.fromPeerId;
   const senderNick = msg.nickname || 'Ghost Peer';
 
-  // 1. PEER_JOINED: A new peer entered the room
-  if (msg.type === 'PEER_JOINED') {
-    if (!inRoom) {
-      enterRoom(activeSessionRoomCode);
-    }
-
-    // Deterministic Initiator Pattern:
-    // The peer with alphabetically SMALLER peerId initiates the WebRTC offer.
-    if (myPeerId < senderId) {
-      initiatePeerConnection(senderId, senderNick);
-    } else {
-      // The other peer sends a PEER_PRESENCE response so the initiator initiates
-      sendSignalingMessage(currentSignalingTopic, {
-        type: 'PEER_PRESENCE',
-        targetPeerId: senderId,
-        fromPeerId: myPeerId,
-        nickname: myNickname
-      });
+  // 1. PEER_HELLO or PEER_HEARTBEAT: Peer discovery in the room
+  if (msg.type === 'PEER_HELLO' || msg.type === 'PEER_HEARTBEAT') {
+    if (!connectedPeers.has(senderId)) {
+      getOrCreatePeerConnection(senderId, senderNick);
     }
   }
 
-  // 2. PEER_PRESENCE: A peer is responding to our PEER_JOINED
-  else if (msg.type === 'PEER_PRESENCE' && msg.targetPeerId === myPeerId) {
-    if (!inRoom) {
-      enterRoom(activeSessionRoomCode);
-    }
-
-    if (myPeerId < senderId && !connectedPeers.has(senderId)) {
-      initiatePeerConnection(senderId, senderNick);
-    }
-  }
-
-  // 3. SDP_OFFER: Targeted offer received
+  // 2. SDP_OFFER: Offer received
   else if (msg.type === 'SDP_OFFER' && msg.targetPeerId === myPeerId) {
-    if (!inRoom) {
-      enterRoom(activeSessionRoomCode);
-    }
     handleIncomingOffer(senderId, senderNick, msg.sdp);
   }
 
-  // 4. SDP_ANSWER: Targeted answer received
+  // 3. SDP_ANSWER: Answer received
   else if (msg.type === 'SDP_ANSWER' && msg.targetPeerId === myPeerId) {
     const peer = connectedPeers.get(senderId);
     if (peer && peer.pc) {
@@ -659,19 +581,18 @@ async function handleSignalingMessage(msg) {
         await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
         await flushPendingIceCandidates(senderId, peer.pc);
       } catch (err) {
-        console.error('Erro ao definir SDP_ANSWER remoto:', err);
+        console.error('Erro ao processar SDP_ANSWER:', err);
       }
     }
   }
 
-  // 5. ICE_CANDIDATE: Targeted ICE candidate received
-  else if (msg.type === 'ICE_CANDIDATE' && msg.targetPeerId === myPeerId) {
+  // 4. ICE: Targeted ICE candidate received
+  else if (msg.type === 'ICE' && msg.targetPeerId === myPeerId) {
     if (msg.candidate) {
       const peer = connectedPeers.get(senderId);
       if (peer && peer.pc && peer.pc.remoteDescription && peer.pc.remoteDescription.type) {
         await addCandidateToPeer(peer.pc, msg.candidate);
       } else {
-        // Queue candidate until remoteDescription is set
         if (!pendingIceCandidates.has(senderId)) {
           pendingIceCandidates.set(senderId, []);
         }
@@ -691,11 +612,11 @@ async function addCandidateToPeer(pc, candData) {
       await pc.addIceCandidate(candData);
     }
   } catch (err) {
-    console.warn('Info ICE candidate:', err.message);
+    // Ignored safely
   }
 }
 
-// Flush Queued ICE Candidates after setRemoteDescription
+// Flush Queued ICE Candidates
 async function flushPendingIceCandidates(peerId, pc) {
   if (pendingIceCandidates.has(peerId)) {
     const candidates = pendingIceCandidates.get(peerId);
@@ -706,27 +627,26 @@ async function flushPendingIceCandidates(peerId, pc) {
   }
 }
 
-// Peer A (Initiator): Create PeerConnection, DataChannel, and send Offer to Peer B
-async function initiatePeerConnection(targetPeerId, targetNickname) {
-  // Clean up any stale connection
+// Get or Create Peer Connection using Negotiated DataChannel (id: 0)
+async function getOrCreatePeerConnection(targetPeerId, targetNickname) {
   if (connectedPeers.has(targetPeerId)) {
-    try {
-      const old = connectedPeers.get(targetPeerId);
-      if (old.dc) old.dc.close();
-      if (old.pc) old.pc.close();
-    } catch (e) {}
-    connectedPeers.delete(targetPeerId);
+    return connectedPeers.get(targetPeerId);
   }
 
+  // Deterministic polarity: smaller peerId is the impolite initiator
+  const isPolite = myPeerId > targetPeerId;
+
   const pc = new RTCPeerConnection(STUN_SERVERS);
-  const dc = pc.createDataChannel('ghostdropChannel', { ordered: true });
+
+  // Pre-negotiated DataChannel with id 0 removes all ondatachannel race conditions!
+  const dc = pc.createDataChannel('ghostdrop', { negotiated: true, id: 0 });
   dc.binaryType = 'arraybuffer';
 
   const peerObj = {
     pc: pc,
     dc: dc,
     nickname: targetNickname,
-    isInitiator: true,
+    isPolite: isPolite,
     state: 'connecting'
   };
   connectedPeers.set(targetPeerId, peerObj);
@@ -737,7 +657,7 @@ async function initiatePeerConnection(targetPeerId, targetNickname) {
   pc.onicecandidate = (event) => {
     if (event.candidate) {
       sendSignalingMessage(currentSignalingTopic, {
-        type: 'ICE_CANDIDATE',
+        type: 'ICE',
         targetPeerId: targetPeerId,
         fromPeerId: myPeerId,
         candidate: event.candidate.toJSON ? event.candidate.toJSON() : {
@@ -751,7 +671,6 @@ async function initiatePeerConnection(targetPeerId, targetNickname) {
   };
 
   pc.onconnectionstatechange = () => {
-    console.log(`[WebRTC] Peer ${targetPeerId} connectionState: ${pc.connectionState}`);
     if (pc.connectionState === 'connected') {
       peerObj.state = 'connected';
       renderParticipantsList();
@@ -760,79 +679,35 @@ async function initiatePeerConnection(targetPeerId, targetNickname) {
     }
   };
 
-  try {
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+  // If impolite peer, initiate offer!
+  if (!isPolite) {
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
 
-    sendSignalingMessage(currentSignalingTopic, {
-      type: 'SDP_OFFER',
-      targetPeerId: targetPeerId,
-      fromPeerId: myPeerId,
-      nickname: myNickname,
-      sdp: offer
-    });
-  } catch (err) {
-    console.error('Erro ao criar SDP_OFFER:', err);
+      sendSignalingMessage(currentSignalingTopic, {
+        type: 'SDP_OFFER',
+        targetPeerId: targetPeerId,
+        fromPeerId: myPeerId,
+        nickname: myNickname,
+        sdp: offer
+      });
+    } catch (err) {
+      console.error('Erro ao gerar SDP_OFFER:', err);
+    }
   }
+
+  return peerObj;
 }
 
-// Peer B (Receiver): Handle Offer from Peer A and send Answer
+// Handle Incoming Offer from remote peer
 async function handleIncomingOffer(fromPeerId, fromNickname, offerSdp) {
-  // Clean up any stale connection
-  if (connectedPeers.has(fromPeerId)) {
-    try {
-      const old = connectedPeers.get(fromPeerId);
-      if (old.dc) old.dc.close();
-      if (old.pc) old.pc.close();
-    } catch (e) {}
-    connectedPeers.delete(fromPeerId);
+  let peerObj = connectedPeers.get(fromPeerId);
+  if (!peerObj) {
+    peerObj = await getOrCreatePeerConnection(fromPeerId, fromNickname);
   }
 
-  const pc = new RTCPeerConnection(STUN_SERVERS);
-
-  const peerObj = {
-    pc: pc,
-    dc: null,
-    nickname: fromNickname,
-    isInitiator: false,
-    state: 'connecting'
-  };
-  connectedPeers.set(fromPeerId, peerObj);
-  renderParticipantsList();
-
-  pc.ondatachannel = (event) => {
-    const dc = event.channel;
-    dc.binaryType = 'arraybuffer';
-    peerObj.dc = dc;
-    setupDataChannelListeners(fromPeerId, dc);
-  };
-
-  pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      sendSignalingMessage(currentSignalingTopic, {
-        type: 'ICE_CANDIDATE',
-        targetPeerId: fromPeerId,
-        fromPeerId: myPeerId,
-        candidate: event.candidate.toJSON ? event.candidate.toJSON() : {
-          candidate: event.candidate.candidate,
-          sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-          usernameFragment: event.candidate.usernameFragment
-        }
-      });
-    }
-  };
-
-  pc.onconnectionstatechange = () => {
-    console.log(`[WebRTC] Peer ${fromPeerId} connectionState: ${pc.connectionState}`);
-    if (pc.connectionState === 'connected') {
-      peerObj.state = 'connected';
-      renderParticipantsList();
-    } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
-      removePeer(fromPeerId);
-    }
-  };
-
+  const pc = peerObj.pc;
   try {
     await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
     await flushPendingIceCandidates(fromPeerId, pc);
@@ -848,21 +723,19 @@ async function handleIncomingOffer(fromPeerId, fromNickname, offerSdp) {
       sdp: answer
     });
   } catch (err) {
-    console.error('Erro ao processar oferta ou criar SDP_ANSWER:', err);
+    console.error('Erro ao processar oferta ou responder SDP_ANSWER:', err);
   }
 }
 
 // Setup DataChannel Listeners with immediate readyState check
 function setupDataChannelListeners(peerId, channel) {
   function handleOpen() {
-    console.log('[WebRTC] DataChannel aberto com sucesso para peer:', peerId);
     const peer = connectedPeers.get(peerId);
     if (peer) {
       peer.state = 'connected';
       peer.dc = channel;
     }
 
-    // Send my info to this peer
     try {
       channel.send(JSON.stringify({
         type: 'PEER_INFO',
@@ -883,7 +756,6 @@ function setupDataChannelListeners(peerId, channel) {
   }
 
   channel.onclose = () => {
-    console.log('[WebRTC] DataChannel fechado para peer:', peerId);
     removePeer(peerId);
   };
 
@@ -1041,7 +913,7 @@ function connectSignaling(topic, onMessageCallback, onConnectCallback) {
 
   const brokerUrl = MQTT_BROKERS[0];
   mqttClient = mqtt.connect(brokerUrl, {
-    clientId: 'ghostdrop_' + Math.random().toString(16).substring(2, 10),
+    clientId: 'ghost_' + Math.random().toString(16).substring(2, 10),
     clean: true,
     connectTimeout: 5000,
     reconnectPeriod: 2000
@@ -1075,13 +947,13 @@ async function sendSignalingMessage(topic, data) {
 }
 
 // UI Transition: Enter Connected Room
-function enterRoom(code) {
+function enterRoomUI(code) {
   inRoom = true;
   pairingSection.classList.add('hidden');
   activeRoomSection.classList.remove('hidden');
   activeRoomCode.textContent = `#${code}`;
   statusDot.className = 'status-dot green pulse';
-  statusPillText.textContent = 'Sala Multi-Peer Ativa';
+  statusPillText.textContent = 'Sala P2P Ativa';
 
   renderParticipantsList();
 }
@@ -1089,9 +961,12 @@ function enterRoom(code) {
 // UI Transition: Leave Room
 function leaveRoom() {
   inRoom = false;
+  clearInterval(heartbeatTimer);
   resetAllConnections();
   activeRoomSection.classList.add('hidden');
   pairingSection.classList.remove('hidden');
+  connectStatusBanner.classList.add('hidden');
+  qrContainer.classList.add('hidden');
   statusDot.className = 'status-dot green';
   statusPillText.textContent = 'E2EE DTLS Pronto';
   chatMessages.innerHTML = `
@@ -1101,8 +976,6 @@ function leaveRoom() {
   `;
   sessionTransfers = [];
   renderTransfersList();
-  generatePairingCode();
-  initHostSignaling(pairingCode);
 }
 
 // Render Participants List & Counter

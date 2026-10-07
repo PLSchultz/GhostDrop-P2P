@@ -95,21 +95,19 @@ python main.py
 
 ```mermaid
 graph TD
-    A[Criador: Gera Sala #749-312] -->|Compartilha Código / Link / QR| B[Participante 2]
-    A -->|Compartilha Código / Link / QR| C[Participante 3]
-    B <-->|Túnel WebRTC Direto| A
-    C <-->|Túnel WebRTC Direto| A
+    A[Usuário A: Sala #749-312] <-->|Túnel WebRTC Direto| B[Usuário B: Sala #749-312]
+    A <-->|Túnel WebRTC Direto| C[Usuário C: Sala #749-312]
     B <-->|Túnel WebRTC Direto| C
 ```
 
 1. **Defina seu Apelido**: Digite seu nome ou apelido no campo de perfil no topo da página.
-2. **Criar Sala**:
-   - Clique em **"Criar Sala Multi-Peer"**.
-   - Compartilhe o código de 6 dígitos (ou envie o link / QR Code).
-   - Clique em **"Abrir Sala Agora"**.
-3. **Entrar na Sala**:
-   - Os outros participantes acessam o link ou entram na aba **"Entrar com Código"** e inserem o código de 6 dígitos.
-4. **Pronto!** Todos os participantes estarão conectados em malha direta para conversar e transferir arquivos.
+2. **Escolha ou Gere um Código**:
+   - O **Usuário A** pode clicar em **"🎲 Gerar Código Aleatório"** (ou digitar qualquer código de 6 dígitos) e clicar em **"Entrar na Sala"**.
+   - O **Usuário B** digita o **mesmo código** (ou acessa o link direto gerado) e clica em **"Entrar na Sala"**.
+3. **Sincronização Instantânea**:
+   - Assim que ambos entram com o mesmo código, a malha P2P é estabelecida automaticamente.
+   - Qualquer número adicional de participantes pode se juntar digitando o mesmo código.
+
 
 ---
 
