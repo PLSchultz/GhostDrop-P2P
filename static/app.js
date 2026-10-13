@@ -23,8 +23,9 @@ const MQTT_BROKERS = [
 ];
 let currentBrokerIndex = 0;
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
-const BUFFER_THRESHOLD = 2 * 1024 * 1024; // 2 MB backpressure threshold
+const CHUNK_SIZE = 256 * 1024;          // 256 KB per chunk for high throughput
+const BUFFER_HIGH = 8 * 1024 * 1024;    // 8 MB: stop sending above this
+const BUFFER_LOW = 2 * 1024 * 1024;    // 2 MB: resume sending below this
 
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
@@ -137,7 +138,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (data && data.lan_ip) localLanIp = data.lan_ip;
       if (data && data.port) localServerPort = data.port;
     })
-    .catch(() => {});
+    .catch(() => { });
 
   // Generate initial code into input
   roomCodeInput.value = generateRandomCode();
@@ -860,7 +861,7 @@ function setupDataChannelListeners(peerId, channel, onConnectedCallback) {
         peerId: myPeerId,
         nickname: myNickname
       }));
-    } catch (e) {}
+    } catch (e) { }
 
     const peerNick = peer ? peer.nickname : 'Participante';
     appendSystemMessage(`⚡ <strong>${escapeHtml(peerNick)}</strong> conectado via <strong>P2P Direto</strong>.`);
@@ -892,7 +893,7 @@ function setupDataChannelListeners(peerId, channel, onConnectedCallback) {
       try {
         const msg = JSON.parse(event.data);
         handleAppMessage(peerId, msg);
-      } catch (e) {}
+      } catch (e) { }
     } else if (event.data instanceof ArrayBuffer) {
       // Binary file chunk received over direct P2P
       receivedChunks.push(event.data);
@@ -913,7 +914,7 @@ function sendPeerAppMessage(targetPeerId, msgObj) {
     try {
       peer.dc.send(JSON.stringify(msgObj));
       return;
-    } catch (e) {}
+    } catch (e) { }
   }
 
   // Fallback to Encrypted MQTT Relay
@@ -1056,7 +1057,7 @@ function removePeer(peerId) {
     try {
       if (peer.dc) peer.dc.close();
       if (peer.pc) peer.pc.close();
-    } catch (e) {}
+    } catch (e) { }
     connectedPeers.delete(peerId);
     pendingIceCandidates.delete(peerId);
     renderParticipantsList();
@@ -1066,7 +1067,7 @@ function removePeer(peerId) {
 // Ephemeral MQTT Connection with broker failover
 function connectSignaling(topic, onMessageCallback, onConnectCallback) {
   if (mqttClient) {
-    try { mqttClient.end(true); } catch (e) {}
+    try { mqttClient.end(true); } catch (e) { }
     mqttClient = null;
   }
 
@@ -1346,20 +1347,46 @@ async function startSendingNextQueuedFile(targetPeerId) {
   const chunkSize = isP2P ? CHUNK_SIZE : 32 * 1024;
   let offset = 0;
 
-  while (offset < file.size) {
-    if (isP2P) {
-      if (targetPeer.dc.bufferedAmount > BUFFER_THRESHOLD) {
-        await new Promise(resolve => {
-          targetPeer.dc.onbufferedamountlow = () => {
-            targetPeer.dc.onbufferedamountlow = null;
-            resolve();
+  if (isP2P) {
+    // ── High-throughput P2P pipeline ─────────────────────────────────────
+    // Keep the DataChannel buffer filled between BUFFER_LOW and BUFFER_HIGH.
+    // Setting bufferedAmountLowThreshold means onbufferedamountlow fires while
+    // there's still headroom, eliminating the stall-to-zero bottleneck.
+    const dc = targetPeer.dc;
+    dc.bufferedAmountLowThreshold = BUFFER_LOW;
+
+    await new Promise((resolve, reject) => {
+      let cancelled = false;
+
+      function pump() {
+        if (cancelled) return;
+        // Fill the buffer up to BUFFER_HIGH in one tight loop
+        while (offset < file.size && dc.bufferedAmount < BUFFER_HIGH) {
+          const end = Math.min(offset + chunkSize, file.size);
+          dc.send(fileBuffer.slice(offset, end));
+          offset = end;
+          updateTransferProgress(offset, file.size);
+        }
+        if (offset >= file.size) {
+          resolve();
+        } else {
+          // Buffer is full — wait for it to drain to BUFFER_LOW, then pump again
+          dc.onbufferedamountlow = () => {
+            dc.onbufferedamountlow = null;
+            pump();
           };
-        });
+        }
       }
-      const chunk = fileBuffer.slice(offset, offset + chunkSize);
-      targetPeer.dc.send(chunk);
-      offset += chunk.byteLength;
-    } else {
+
+      pump();
+    });
+
+    // Restore default threshold
+    targetPeer.dc.bufferedAmountLowThreshold = 0;
+
+  } else {
+    // ── Relay mode: chunked over MQTT ────────────────────────────────────
+    while (offset < file.size) {
       const chunk = fileBuffer.slice(offset, offset + chunkSize);
       const chunkArray = Array.from(new Uint8Array(chunk));
       sendSignalingMessage(currentSignalingTopic, {
@@ -1369,10 +1396,9 @@ async function startSendingNextQueuedFile(targetPeerId) {
         chunk: chunkArray
       });
       offset += chunk.byteLength;
-      await new Promise(r => setTimeout(r, 6));
+      updateTransferProgress(offset, file.size);
+      await new Promise(r => setTimeout(r, 2));
     }
-
-    updateTransferProgress(offset, file.size);
   }
 
   sendPeerAppMessage(targetPeerId, {
@@ -1500,7 +1526,7 @@ function resetAllConnections() {
     try {
       if (peer.dc) peer.dc.close();
       if (peer.pc) peer.pc.close();
-    } catch (e) {}
+    } catch (e) { }
   });
   connectedPeers.clear();
   pendingIceCandidates.clear();
