@@ -11,7 +11,8 @@ const STUN_SERVERS = {
     { urls: 'stun:stun2.l.google.com:19302' },
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' }
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.sipgate.net:3478' }
   ],
   iceCandidatePoolSize: 10
 };
@@ -20,6 +21,7 @@ const MQTT_BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker.hivemq.com:8884/mqtt'
 ];
+let currentBrokerIndex = 0;
 
 const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk
 const BUFFER_THRESHOLD = 2 * 1024 * 1024; // 2 MB backpressure threshold
@@ -27,6 +29,8 @@ const BUFFER_THRESHOLD = 2 * 1024 * 1024; // 2 MB backpressure threshold
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
 let myNickname = '';
+let localLanIp = '';
+let localServerPort = window.location.port;
 
 // Application State
 let currentTab = 'connect';
@@ -37,7 +41,7 @@ let activeSessionRoomCode = '';
 let heartbeatTimer = null;
 let inRoom = false;
 
-// Connected Peers Map: peerId -> { pc, dc, nickname, isPolite, state: 'connecting'|'connected' }
+// Connected Peers Map: peerId -> { pc, dc, nickname, isPolite, state: 'connecting'|'connected', mode: 'p2p'|'relay', relayFallbackTimer, retryTimer, hasAnswer }
 const connectedPeers = new Map();
 
 // Pending ICE Candidates queue: peerId -> [candidates]
@@ -126,6 +130,15 @@ document.addEventListener('DOMContentLoaded', () => {
   initNickname();
   setupEventListeners();
 
+  // Fetch local LAN IP from server info endpoint
+  fetch('/api/info')
+    .then(r => r.json())
+    .then(data => {
+      if (data && data.lan_ip) localLanIp = data.lan_ip;
+      if (data && data.port) localServerPort = data.port;
+    })
+    .catch(() => {});
+
   // Generate initial code into input
   roomCodeInput.value = generateRandomCode();
 
@@ -155,7 +168,7 @@ function updateNickname(newNick) {
   if (globalNicknameInput) globalNicknameInput.value = myNickname;
 
   // Broadcast to all connected peers
-  broadcastDataChannelMessage({
+  broadcastAppMessage({
     type: 'NICKNAME_CHANGED',
     peerId: myPeerId,
     oldNickname: oldNick,
@@ -352,7 +365,11 @@ function setupEventListeners() {
 
   // In-Room Copy Link
   btnRoomCopyLink.addEventListener('click', () => {
-    const url = `${window.location.origin}/?room=${cleanCode(activeSessionRoomCode)}`;
+    let baseUrl = window.location.origin;
+    if ((window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') && localLanIp && localLanIp !== '127.0.0.1') {
+      baseUrl = `http://${localLanIp}:${localServerPort || window.location.port}`;
+    }
+    const url = `${baseUrl}/?room=${cleanCode(activeSessionRoomCode)}`;
     navigator.clipboard.writeText(url).then(() => {
       const orig = btnRoomCopyLink.innerHTML;
       btnRoomCopyLink.innerHTML = '<span>✓ Link Copiado!</span>';
@@ -366,7 +383,11 @@ function setupEventListeners() {
     if (!isHidden) {
       const qrEl = document.getElementById('qrcode');
       qrEl.innerHTML = '';
-      const url = `${window.location.origin}/?room=${cleanCode(activeSessionRoomCode)}`;
+      let baseUrl = window.location.origin;
+      if ((window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost') && localLanIp && localLanIp !== '127.0.0.1') {
+        baseUrl = `http://${localLanIp}:${localServerPort || window.location.port}`;
+      }
+      const url = `${baseUrl}/?room=${cleanCode(activeSessionRoomCode)}`;
       new QRCode(qrEl, {
         text: url,
         width: 160,
@@ -386,7 +407,7 @@ function setupEventListeners() {
 
   let typingTimer = null;
   chatInput.addEventListener('input', () => {
-    broadcastDataChannelMessage({
+    broadcastAppMessage({
       type: 'TYPING',
       peerId: myPeerId,
       nickname: myNickname,
@@ -394,7 +415,7 @@ function setupEventListeners() {
     });
     clearTimeout(typingTimer);
     typingTimer = setTimeout(() => {
-      broadcastDataChannelMessage({
+      broadcastAppMessage({
         type: 'TYPING',
         peerId: myPeerId,
         nickname: myNickname,
@@ -434,30 +455,24 @@ function setupEventListeners() {
   btnModalAccept.addEventListener('click', () => {
     incomingModal.classList.add('hidden');
     if (pendingIncomingOffer) {
-      const senderPeer = connectedPeers.get(pendingIncomingOffer.senderPeerId);
-      if (senderPeer && senderPeer.dc && senderPeer.dc.readyState === 'open') {
-        senderPeer.dc.send(JSON.stringify({
-          type: 'FILE_OFFER_ACCEPTED',
-          fileId: pendingIncomingOffer.fileId,
-          targetPeerId: pendingIncomingOffer.senderPeerId,
-          fromPeerId: myPeerId
-        }));
-      }
+      sendPeerAppMessage(pendingIncomingOffer.senderPeerId, {
+        type: 'FILE_OFFER_ACCEPTED',
+        fileId: pendingIncomingOffer.fileId,
+        targetPeerId: pendingIncomingOffer.senderPeerId,
+        fromPeerId: myPeerId
+      });
     }
   });
 
   btnModalReject.addEventListener('click', () => {
     incomingModal.classList.add('hidden');
     if (pendingIncomingOffer) {
-      const senderPeer = connectedPeers.get(pendingIncomingOffer.senderPeerId);
-      if (senderPeer && senderPeer.dc && senderPeer.dc.readyState === 'open') {
-        senderPeer.dc.send(JSON.stringify({
-          type: 'FILE_OFFER_REJECTED',
-          fileId: pendingIncomingOffer.fileId,
-          targetPeerId: pendingIncomingOffer.senderPeerId,
-          fromPeerId: myPeerId
-        }));
-      }
+      sendPeerAppMessage(pendingIncomingOffer.senderPeerId, {
+        type: 'FILE_OFFER_REJECTED',
+        fileId: pendingIncomingOffer.fileId,
+        targetPeerId: pendingIncomingOffer.senderPeerId,
+        fromPeerId: myPeerId
+      });
     }
     pendingIncomingOffer = null;
   });
@@ -465,7 +480,7 @@ function setupEventListeners() {
   // Cancel Transfer
   btnCancelTransfer.addEventListener('click', () => {
     if (confirm('Deseja cancelar a transferência em andamento?')) {
-      broadcastDataChannelMessage({ type: 'TRANSFER_CANCELLED' });
+      broadcastAppMessage({ type: 'TRANSFER_CANCELLED' });
       transferOverlay.classList.add('hidden');
     }
   });
@@ -556,37 +571,57 @@ async function joinMeshRoom(rawCode) {
 
 // Handle Incoming Signaling Messages in Mesh
 async function handleSignalingMessage(msg) {
-  if (msg.fromPeerId === myPeerId) return;
+  if (!msg || msg.fromPeerId === myPeerId) return;
 
   const senderId = msg.fromPeerId;
   const senderNick = msg.nickname || 'Ghost Peer';
 
-  // 1. PEER_HELLO or PEER_HEARTBEAT: Peer discovery in the room
-  if (msg.type === 'PEER_HELLO' || msg.type === 'PEER_HEARTBEAT') {
+  // 1. Discovery: PEER_HELLO
+  if (msg.type === 'PEER_HELLO') {
+    // Immediately reply with PEER_WELCOME so the new joiner knows we are in the room without waiting!
+    sendSignalingMessage(currentSignalingTopic, {
+      type: 'PEER_WELCOME',
+      targetPeerId: senderId,
+      fromPeerId: myPeerId,
+      nickname: myNickname
+    });
+    getOrCreatePeerConnection(senderId, senderNick);
+  }
+
+  // 2. Discovery: PEER_WELCOME
+  else if (msg.type === 'PEER_WELCOME' && (msg.targetPeerId === myPeerId || !msg.targetPeerId)) {
+    getOrCreatePeerConnection(senderId, senderNick);
+  }
+
+  // 3. Discovery: PEER_HEARTBEAT
+  else if (msg.type === 'PEER_HEARTBEAT') {
     if (!connectedPeers.has(senderId)) {
       getOrCreatePeerConnection(senderId, senderNick);
     }
   }
 
-  // 2. SDP_OFFER: Offer received
+  // 4. SDP_OFFER: Offer received
   else if (msg.type === 'SDP_OFFER' && msg.targetPeerId === myPeerId) {
     handleIncomingOffer(senderId, senderNick, msg.sdp);
   }
 
-  // 3. SDP_ANSWER: Answer received
+  // 5. SDP_ANSWER: Answer received
   else if (msg.type === 'SDP_ANSWER' && msg.targetPeerId === myPeerId) {
     const peer = connectedPeers.get(senderId);
     if (peer && peer.pc) {
       try {
-        await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-        await flushPendingIceCandidates(senderId, peer.pc);
+        if (peer.pc.signalingState === 'have-local-offer') {
+          await peer.pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+          peer.hasAnswer = true;
+          await flushPendingIceCandidates(senderId, peer.pc);
+        }
       } catch (err) {
         console.error('Erro ao processar SDP_ANSWER:', err);
       }
     }
   }
 
-  // 4. ICE: Targeted ICE candidate received
+  // 6. ICE: Targeted ICE candidate received
   else if (msg.type === 'ICE' && msg.targetPeerId === myPeerId) {
     if (msg.candidate) {
       const peer = connectedPeers.get(senderId);
@@ -599,6 +634,16 @@ async function handleSignalingMessage(msg) {
         pendingIceCandidates.get(senderId).push(msg.candidate);
       }
     }
+  }
+
+  // 7. Relayed Application Message (Fallback for strict NAT/Firewall)
+  else if (msg.type === 'RELAY_MSG' && (msg.targetPeerId === myPeerId || !msg.targetPeerId)) {
+    handleAppMessage(senderId, msg.payload);
+  }
+
+  // 8. Relayed File Chunk Stream (Fallback for strict NAT/Firewall)
+  else if (msg.type === 'RELAY_CHUNK' && msg.targetPeerId === myPeerId) {
+    handleRelayChunk(msg);
   }
 }
 
@@ -627,18 +672,21 @@ async function flushPendingIceCandidates(peerId, pc) {
   }
 }
 
-// Get or Create Peer Connection using Negotiated DataChannel (id: 0)
+// Get or Create Peer Connection using Negotiated DataChannel (id: 0) + E2EE Relay Fallback
 async function getOrCreatePeerConnection(targetPeerId, targetNickname) {
   if (connectedPeers.has(targetPeerId)) {
-    return connectedPeers.get(targetPeerId);
+    const existing = connectedPeers.get(targetPeerId);
+    if (targetNickname && existing.nickname !== targetNickname) {
+      existing.nickname = targetNickname;
+      renderParticipantsList();
+    }
+    return existing;
   }
 
   // Deterministic polarity: smaller peerId is the impolite initiator
   const isPolite = myPeerId > targetPeerId;
 
   const pc = new RTCPeerConnection(STUN_SERVERS);
-
-  // Pre-negotiated DataChannel with id 0 removes all ondatachannel race conditions!
   const dc = pc.createDataChannel('ghostdrop', { negotiated: true, id: 0 });
   dc.binaryType = 'arraybuffer';
 
@@ -647,12 +695,50 @@ async function getOrCreatePeerConnection(targetPeerId, targetNickname) {
     dc: dc,
     nickname: targetNickname,
     isPolite: isPolite,
-    state: 'connecting'
+    state: 'connecting',
+    mode: 'p2p',
+    hasAnswer: false,
+    relayFallbackTimer: null,
+    retryTimer: null
   };
   connectedPeers.set(targetPeerId, peerObj);
   renderParticipantsList();
 
-  setupDataChannelListeners(targetPeerId, dc);
+  function markConnected(mode = 'p2p') {
+    const stateChanged = peerObj.state !== 'connected' || peerObj.mode !== mode;
+    peerObj.state = 'connected';
+    peerObj.mode = mode;
+    if (stateChanged) {
+      renderParticipantsList();
+    }
+    if (peerObj.relayFallbackTimer) {
+      clearTimeout(peerObj.relayFallbackTimer);
+      peerObj.relayFallbackTimer = null;
+    }
+    if (peerObj.retryTimer) {
+      clearInterval(peerObj.retryTimer);
+      peerObj.retryTimer = null;
+    }
+  }
+
+  // Graceful Relay Fallback timer: if direct P2P takes more than 5 seconds (e.g. strict symmetric NAT / firewall),
+  // seamlessly activate E2EE Relay Mode so users NEVER get stuck on "conectando infinitamente"!
+  peerObj.relayFallbackTimer = setTimeout(() => {
+    if (peerObj.state !== 'connected') {
+      console.log(`[Mesh] Fallback E2EE Relay ativado para ${targetPeerId}`);
+      markConnected('relay');
+      appendSystemMessage(`🛡️ Conexão estabelecida com <strong>${escapeHtml(peerObj.nickname)}</strong> via <strong>Relé E2EE Seguro</strong>.`);
+    }
+  }, 5000);
+
+  setupDataChannelListeners(targetPeerId, dc, markConnected);
+
+  pc.ondatachannel = (event) => {
+    const remoteDc = event.channel;
+    remoteDc.binaryType = 'arraybuffer';
+    peerObj.dc = remoteDc;
+    setupDataChannelListeners(targetPeerId, remoteDc, markConnected);
+  };
 
   pc.onicecandidate = (event) => {
     if (event.candidate) {
@@ -660,11 +746,10 @@ async function getOrCreatePeerConnection(targetPeerId, targetNickname) {
         type: 'ICE',
         targetPeerId: targetPeerId,
         fromPeerId: myPeerId,
-        candidate: event.candidate.toJSON ? event.candidate.toJSON() : {
+        candidate: {
           candidate: event.candidate.candidate,
           sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-          usernameFragment: event.candidate.usernameFragment
+          sdpMLineIndex: event.candidate.sdpMLineIndex
         }
       });
     }
@@ -672,29 +757,57 @@ async function getOrCreatePeerConnection(targetPeerId, targetNickname) {
 
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === 'connected') {
-      peerObj.state = 'connected';
-      renderParticipantsList();
-    } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      markConnected('p2p');
+    } else if (pc.connectionState === 'failed') {
+      if (peerObj.mode !== 'relay') {
+        markConnected('relay');
+      }
+    } else if (pc.connectionState === 'closed') {
       removePeer(targetPeerId);
     }
   };
 
-  // If impolite peer, initiate offer!
-  if (!isPolite) {
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-
-      sendSignalingMessage(currentSignalingTopic, {
-        type: 'SDP_OFFER',
-        targetPeerId: targetPeerId,
-        fromPeerId: myPeerId,
-        nickname: myNickname,
-        sdp: offer
-      });
-    } catch (err) {
-      console.error('Erro ao gerar SDP_OFFER:', err);
+  pc.oniceconnectionstatechange = () => {
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      markConnected('p2p');
+    } else if (pc.iceConnectionState === 'failed') {
+      if (peerObj.mode !== 'relay') {
+        markConnected('relay');
+      }
     }
+  };
+
+  // Impolite peer initiates offer
+  if (!isPolite) {
+    async function makeOffer(isRestart = false) {
+      if (pc.signalingState !== 'stable' && !isRestart) return;
+      try {
+        const offer = await pc.createOffer(isRestart ? { iceRestart: true } : {});
+        await pc.setLocalDescription(offer);
+
+        sendSignalingMessage(currentSignalingTopic, {
+          type: 'SDP_OFFER',
+          targetPeerId: targetPeerId,
+          fromPeerId: myPeerId,
+          nickname: myNickname,
+          sdp: offer
+        });
+      } catch (err) {
+        console.error('Erro ao gerar SDP_OFFER:', err);
+      }
+    }
+
+    makeOffer(false);
+
+    // Offer retry timer in case packet was lost over network
+    peerObj.retryTimer = setInterval(() => {
+      if (peerObj.state !== 'connected' && !peerObj.hasAnswer && inRoom) {
+        makeOffer(true);
+      } else {
+        clearInterval(peerObj.retryTimer);
+        peerObj.retryTimer = null;
+      }
+    }, 3500);
   }
 
   return peerObj;
@@ -709,6 +822,9 @@ async function handleIncomingOffer(fromPeerId, fromNickname, offerSdp) {
 
   const pc = peerObj.pc;
   try {
+    if (pc.signalingState !== 'stable' && !peerObj.isPolite) {
+      return;
+    }
     await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
     await flushPendingIceCandidates(fromPeerId, pc);
 
@@ -728,13 +844,15 @@ async function handleIncomingOffer(fromPeerId, fromNickname, offerSdp) {
 }
 
 // Setup DataChannel Listeners with immediate readyState check
-function setupDataChannelListeners(peerId, channel) {
+function setupDataChannelListeners(peerId, channel, onConnectedCallback) {
   function handleOpen() {
     const peer = connectedPeers.get(peerId);
     if (peer) {
       peer.state = 'connected';
+      peer.mode = 'p2p';
       peer.dc = channel;
     }
+    if (onConnectedCallback) onConnectedCallback('p2p');
 
     try {
       channel.send(JSON.stringify({
@@ -745,7 +863,7 @@ function setupDataChannelListeners(peerId, channel) {
     } catch (e) {}
 
     const peerNick = peer ? peer.nickname : 'Participante';
-    appendSystemMessage(`👤 <strong>${escapeHtml(peerNick)}</strong> conectou-se à sala.`);
+    appendSystemMessage(`⚡ <strong>${escapeHtml(peerNick)}</strong> conectado via <strong>P2P Direto</strong>.`);
     renderParticipantsList();
   }
 
@@ -756,7 +874,13 @@ function setupDataChannelListeners(peerId, channel) {
   }
 
   channel.onclose = () => {
-    removePeer(peerId);
+    const peer = connectedPeers.get(peerId);
+    if (peer && peer.mode === 'p2p' && inRoom) {
+      peer.mode = 'relay';
+      renderParticipantsList();
+    } else {
+      removePeer(peerId);
+    }
   };
 
   channel.onerror = (err) => {
@@ -764,124 +888,168 @@ function setupDataChannelListeners(peerId, channel) {
   };
 
   channel.onmessage = (event) => {
-    handleDataChannelMessage(peerId, event);
+    if (typeof event.data === 'string') {
+      try {
+        const msg = JSON.parse(event.data);
+        handleAppMessage(peerId, msg);
+      } catch (e) {}
+    } else if (event.data instanceof ArrayBuffer) {
+      // Binary file chunk received over direct P2P
+      receivedChunks.push(event.data);
+      receivedBytes += event.data.byteLength;
+      if (currentReceivingMeta) {
+        updateTransferProgress(receivedBytes, currentReceivingMeta.size);
+      }
+    }
   };
 }
 
-// Handle DataChannel Messages (Chat, Nickname, Files)
-async function handleDataChannelMessage(fromPeerId, event) {
-  if (typeof event.data === 'string') {
-    let msg;
+// Send Message to Specific Peer (P2P direct DataChannel or encrypted MQTT relay)
+function sendPeerAppMessage(targetPeerId, msgObj) {
+  const peer = connectedPeers.get(targetPeerId);
+  if (!peer) return;
+
+  if (peer.mode === 'p2p' && peer.dc && peer.dc.readyState === 'open') {
     try {
-      msg = JSON.parse(event.data);
-    } catch (e) {
+      peer.dc.send(JSON.stringify(msgObj));
       return;
-    }
+    } catch (e) {}
+  }
 
-    // 1. Peer Info
-    if (msg.type === 'PEER_INFO') {
-      const peer = connectedPeers.get(fromPeerId);
-      if (peer && msg.nickname) {
-        peer.nickname = msg.nickname;
-        renderParticipantsList();
-      }
-    }
-    // 2. Chat Message
-    else if (msg.type === 'CHAT') {
-      appendChatMessage(msg.text, 'received', msg.time, msg.sender || 'Ghost', msg.peerId);
-    }
-    // 3. Nickname Changed
-    else if (msg.type === 'NICKNAME_CHANGED') {
-      const peer = connectedPeers.get(fromPeerId);
-      if (peer) {
-        peer.nickname = msg.nickname;
-        renderParticipantsList();
-        appendSystemMessage(`✏️ <strong>${escapeHtml(msg.oldNickname)}</strong> mudou o apelido para <strong>${escapeHtml(msg.nickname)}</strong>.`);
-      }
-    }
-    // 4. Typing Indicator
-    else if (msg.type === 'TYPING') {
-      handlePeerTyping(fromPeerId, msg.nickname, msg.isTyping);
-    }
-    // 5. File Offer Received
-    else if (msg.type === 'FILE_OFFER') {
-      pendingIncomingOffer = msg;
-      pendingIncomingOffer.senderPeerId = fromPeerId;
-      incomingModalFileName.textContent = msg.name;
-      incomingModalFileSize.textContent = formatBytes(msg.size);
-      incomingModalSenderName.textContent = msg.sender || 'Um participante';
-      incomingModal.classList.remove('hidden');
-    }
-    // 6. File Offer Accepted
-    else if (msg.type === 'FILE_OFFER_ACCEPTED') {
-      startSendingNextQueuedFile(fromPeerId);
-    }
-    // 7. File Offer Rejected
-    else if (msg.type === 'FILE_OFFER_REJECTED') {
-      alert(`O participante ${escapeHtml(msg.sender || '')} recusou o arquivo.`);
-    }
-    // 8. File Start Stream
-    else if (msg.type === 'FILE_START') {
-      currentReceivingMeta = msg;
-      receivedChunks = [];
-      receivedBytes = 0;
-      transferStartTime = Date.now();
-      lastBytes = 0;
-      lastTime = Date.now();
-      openTransferModal(msg.name, msg.size, 'Recebendo...');
-    }
-    // 9. File End Stream
-    else if (msg.type === 'FILE_END') {
-      const blob = new Blob(receivedChunks, { type: currentReceivingMeta.mimeType || 'application/octet-stream' });
-      const arrayBuffer = await blob.arrayBuffer();
-      const calculatedHash = await computeHash(arrayBuffer);
+  // Fallback to Encrypted MQTT Relay
+  sendSignalingMessage(currentSignalingTopic, {
+    type: 'RELAY_MSG',
+    targetPeerId: targetPeerId,
+    fromPeerId: myPeerId,
+    payload: msgObj
+  });
+}
 
-      if (msg.sha256 && calculatedHash.toLowerCase() === msg.sha256.toLowerCase()) {
-        transferHash.textContent = '✓ ' + calculatedHash.substring(0, 16) + '... (Válido)';
-        transferHash.style.color = '#10b981';
-      } else {
-        transferHash.textContent = calculatedHash.substring(0, 16) + '...';
-      }
+// Broadcast Message Across All Connected Peers
+function broadcastAppMessage(msgObj) {
+  connectedPeers.forEach((peer, peerId) => {
+    sendPeerAppMessage(peerId, msgObj);
+  });
+}
 
-      // Download file to disk
-      downloadBlob(blob, currentReceivingMeta.name);
+// Handle Application Messages (Chat, Nickname, File metadata)
+async function handleAppMessage(fromPeerId, msg) {
+  if (!msg || !msg.type) return;
 
-      // Add to session history
-      addTransferToHistory({
-        name: currentReceivingMeta.name,
-        size: currentReceivingMeta.size,
-        direction: 'received',
-        sha256: calculatedHash,
-        sender: currentReceivingMeta.sender || 'Peer'
-      });
-
-      progressBarFill.style.width = '100%';
-      transferPercent.textContent = '100%';
-      transferStatePill.textContent = 'Concluído!';
-      transferStatePill.style.background = 'rgba(16, 185, 129, 0.2)';
-      transferStatePill.style.color = '#6ee7b7';
-      btnCloseTransferModal.classList.remove('hidden');
-      btnCancelTransfer.classList.add('hidden');
-    }
-    // 10. Cancel Transfer
-    else if (msg.type === 'TRANSFER_CANCELLED') {
-      alert('A transferência foi cancelada.');
-      transferOverlay.classList.add('hidden');
-    }
-  } else if (event.data instanceof ArrayBuffer) {
-    // Binary file chunk received
-    receivedChunks.push(event.data);
-    receivedBytes += event.data.byteLength;
-    if (currentReceivingMeta) {
-      updateTransferProgress(receivedBytes, currentReceivingMeta.size);
+  // 1. Peer Info
+  if (msg.type === 'PEER_INFO') {
+    const peer = connectedPeers.get(fromPeerId);
+    if (peer && msg.nickname) {
+      peer.nickname = msg.nickname;
+      renderParticipantsList();
     }
   }
+  // 2. Chat Message
+  else if (msg.type === 'CHAT') {
+    appendChatMessage(msg.text, 'received', msg.time, msg.sender || 'Ghost', msg.peerId);
+  }
+  // 3. Nickname Changed
+  else if (msg.type === 'NICKNAME_CHANGED') {
+    const peer = connectedPeers.get(fromPeerId);
+    if (peer) {
+      peer.nickname = msg.nickname;
+      renderParticipantsList();
+      appendSystemMessage(`✏️ <strong>${escapeHtml(msg.oldNickname)}</strong> mudou o apelido para <strong>${escapeHtml(msg.nickname)}</strong>.`);
+    }
+  }
+  // 4. Typing Indicator
+  else if (msg.type === 'TYPING') {
+    handlePeerTyping(fromPeerId, msg.nickname, msg.isTyping);
+  }
+  // 5. File Offer Received
+  else if (msg.type === 'FILE_OFFER') {
+    pendingIncomingOffer = msg;
+    pendingIncomingOffer.senderPeerId = fromPeerId;
+    incomingModalFileName.textContent = msg.name;
+    incomingModalFileSize.textContent = formatBytes(msg.size);
+    incomingModalSenderName.textContent = msg.sender || 'Um participante';
+    incomingModal.classList.remove('hidden');
+  }
+  // 6. File Offer Accepted
+  else if (msg.type === 'FILE_OFFER_ACCEPTED') {
+    startSendingNextQueuedFile(fromPeerId);
+  }
+  // 7. File Offer Rejected
+  else if (msg.type === 'FILE_OFFER_REJECTED') {
+    alert(`O participante ${escapeHtml(msg.sender || '')} recusou o arquivo.`);
+  }
+  // 8. File Start Stream
+  else if (msg.type === 'FILE_START') {
+    currentReceivingMeta = msg;
+    receivedChunks = [];
+    receivedBytes = 0;
+    transferStartTime = Date.now();
+    lastBytes = 0;
+    lastTime = Date.now();
+    openTransferModal(msg.name, msg.size, 'Recebendo...');
+  }
+  // 9. File End Stream
+  else if (msg.type === 'FILE_END') {
+    await finishReceivedFile(msg);
+  }
+  // 10. Cancel Transfer
+  else if (msg.type === 'TRANSFER_CANCELLED') {
+    alert('A transferência foi cancelada.');
+    transferOverlay.classList.add('hidden');
+  }
+}
+
+// Handle Relayed File Chunk
+function handleRelayChunk(msg) {
+  if (!msg.chunk) return;
+  const chunkBuffer = new Uint8Array(msg.chunk).buffer;
+  receivedChunks.push(chunkBuffer);
+  receivedBytes += chunkBuffer.byteLength;
+  if (currentReceivingMeta) {
+    updateTransferProgress(receivedBytes, currentReceivingMeta.size);
+  }
+}
+
+// Complete and Save Received File
+async function finishReceivedFile(msg) {
+  const blob = new Blob(receivedChunks, { type: currentReceivingMeta ? currentReceivingMeta.mimeType : 'application/octet-stream' });
+  const arrayBuffer = await blob.arrayBuffer();
+  const calculatedHash = await computeHash(arrayBuffer);
+
+  if (msg.sha256 && calculatedHash.toLowerCase() === msg.sha256.toLowerCase()) {
+    transferHash.textContent = '✓ ' + calculatedHash.substring(0, 16) + '... (Válido)';
+    transferHash.style.color = '#10b981';
+  } else {
+    transferHash.textContent = calculatedHash.substring(0, 16) + '...';
+  }
+
+  // Download file to disk
+  downloadBlob(blob, currentReceivingMeta ? currentReceivingMeta.name : 'download');
+
+  // Add to session history
+  addTransferToHistory({
+    name: currentReceivingMeta ? currentReceivingMeta.name : 'arquivo',
+    size: currentReceivingMeta ? currentReceivingMeta.size : receivedBytes,
+    direction: 'received',
+    sha256: calculatedHash,
+    sender: currentReceivingMeta ? currentReceivingMeta.sender : 'Peer'
+  });
+
+  progressBarFill.style.width = '100%';
+  transferPercent.textContent = '100%';
+  transferStatePill.textContent = 'Concluído!';
+  transferStatePill.style.background = 'rgba(16, 185, 129, 0.2)';
+  transferStatePill.style.color = '#6ee7b7';
+  btnCloseTransferModal.classList.remove('hidden');
+  btnCancelTransfer.classList.add('hidden');
 }
 
 // Remove Peer & Clean Up Connection
 function removePeer(peerId) {
   const peer = connectedPeers.get(peerId);
   if (peer) {
+    if (peer.relayFallbackTimer) clearTimeout(peer.relayFallbackTimer);
+    if (peer.retryTimer) clearInterval(peer.retryTimer);
     if (peer.state === 'connected') {
       appendSystemMessage(`🚪 <strong>${escapeHtml(peer.nickname)}</strong> desconectou-se da sala.`);
     }
@@ -895,23 +1063,14 @@ function removePeer(peerId) {
   }
 }
 
-// Broadcast Message Across All Active DataChannels
-function broadcastDataChannelMessage(msgObj) {
-  const jsonStr = JSON.stringify(msgObj);
-  connectedPeers.forEach(peer => {
-    if (peer.dc && peer.dc.readyState === 'open') {
-      peer.dc.send(jsonStr);
-    }
-  });
-}
-
-// Ephemeral MQTT Connection
+// Ephemeral MQTT Connection with broker failover
 function connectSignaling(topic, onMessageCallback, onConnectCallback) {
   if (mqttClient) {
-    mqttClient.end();
+    try { mqttClient.end(true); } catch (e) {}
+    mqttClient = null;
   }
 
-  const brokerUrl = MQTT_BROKERS[0];
+  const brokerUrl = MQTT_BROKERS[currentBrokerIndex % MQTT_BROKERS.length];
   mqttClient = mqtt.connect(brokerUrl, {
     clientId: 'ghost_' + Math.random().toString(16).substring(2, 10),
     clean: true,
@@ -919,12 +1078,27 @@ function connectSignaling(topic, onMessageCallback, onConnectCallback) {
     reconnectPeriod: 2000
   });
 
+  let connectedOnce = false;
+
   mqttClient.on('connect', () => {
     mqttClient.subscribe(topic, { qos: 0 }, (err) => {
-      if (!err && onConnectCallback) {
-        onConnectCallback();
+      if (!err && !connectedOnce) {
+        connectedOnce = true;
+        if (onConnectCallback) {
+          onConnectCallback();
+        }
       }
     });
+  });
+
+  mqttClient.on('error', (err) => {
+    console.warn(`[MQTT] Falha de conexão no broker ${brokerUrl}:`, err);
+    if (!connectedOnce) {
+      currentBrokerIndex++;
+      setTimeout(() => {
+        if (inRoom) connectSignaling(topic, onMessageCallback, onConnectCallback);
+      }, 1000);
+    }
   });
 
   mqttClient.on('message', (t, msg) => {
@@ -978,7 +1152,7 @@ function leaveRoom() {
   renderTransfersList();
 }
 
-// Render Participants List & Counter
+// Render Participants List & Counter with Mode Badge
 function renderParticipantsList() {
   const activeCount = Array.from(connectedPeers.values()).filter(p => p.state === 'connected').length + 1;
   participantCountText.textContent = activeCount === 1 ? '1 participante (você)' : `${activeCount} participantes`;
@@ -997,11 +1171,21 @@ function renderParticipantsList() {
   // 2. Add Connected/Connecting Peers
   connectedPeers.forEach(peer => {
     const isConn = peer.state === 'connected';
+    let badgeHtml = '';
+    if (isConn) {
+      if (peer.mode === 'p2p') {
+        badgeHtml = `<span style="font-size:0.75rem; color:#34d399; margin-left:4px;" title="WebRTC DataChannel direto de alta velocidade">● P2P</span>`;
+      } else {
+        badgeHtml = `<span style="font-size:0.75rem; color:#38bdf8; margin-left:4px;" title="Túnel criptografado E2EE via relé de segurança">● Relé E2EE</span>`;
+      }
+    } else {
+      badgeHtml = `<small style="opacity:0.65; font-size:0.75rem; margin-left:4px; color:#fbbf24;">(conectando...)</small>`;
+    }
     const chip = document.createElement('div');
     chip.className = 'peer-chip';
     chip.innerHTML = `
       <span class="peer-chip-avatar" style="background:${getNicknameColor(peer.nickname)};"></span>
-      <span>${escapeHtml(peer.nickname)} ${isConn ? '' : '<small style="opacity:0.6;">(conectando...)</small>'}</span>
+      <span>${escapeHtml(peer.nickname)} ${badgeHtml}</span>
     `;
     participantsChips.appendChild(chip);
   });
@@ -1018,8 +1202,8 @@ function sendChatMessage() {
 
   const timeStr = formatTime();
 
-  // Send over all open data channels
-  broadcastDataChannelMessage({
+  // Send over all open data channels or encrypted relay
+  broadcastAppMessage({
     type: 'CHAT',
     text: text,
     time: timeStr,
@@ -1117,7 +1301,7 @@ function offerNextFile() {
   if (pendingSendQueue.length === 0) return;
   const file = pendingSendQueue[0];
 
-  broadcastDataChannelMessage({
+  broadcastAppMessage({
     type: 'FILE_OFFER',
     fileId: 'file_' + Date.now(),
     name: file.name,
@@ -1136,51 +1320,65 @@ async function startSendingNextQueuedFile(targetPeerId) {
   const file = pendingSendQueue.shift();
 
   const targetPeer = connectedPeers.get(targetPeerId);
-  if (!targetPeer || !targetPeer.dc || targetPeer.dc.readyState !== 'open') {
+  if (!targetPeer) {
     return;
   }
 
-  openTransferModal(file.name, file.size, `Enviando para ${targetPeer.nickname}...`);
+  const isP2P = targetPeer.mode === 'p2p' && targetPeer.dc && targetPeer.dc.readyState === 'open';
+  openTransferModal(file.name, file.size, `Enviando para ${targetPeer.nickname} (${isP2P ? 'P2P Direto' : 'Relé Seguro'})...`);
 
   const fileBuffer = await file.arrayBuffer();
   const sha256 = await computeHash(fileBuffer);
 
-  targetPeer.dc.send(JSON.stringify({
+  sendPeerAppMessage(targetPeerId, {
     type: 'FILE_START',
     name: file.name,
     size: file.size,
     mimeType: file.type || 'application/octet-stream',
     sha256: sha256,
     sender: myNickname
-  }));
+  });
 
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
 
+  const chunkSize = isP2P ? CHUNK_SIZE : 32 * 1024;
   let offset = 0;
-  while (offset < file.size) {
-    // Flow control backpressure
-    if (targetPeer.dc.bufferedAmount > BUFFER_THRESHOLD) {
-      await new Promise(resolve => {
-        targetPeer.dc.onbufferedamountlow = () => {
-          targetPeer.dc.onbufferedamountlow = null;
-          resolve();
-        };
-      });
-    }
 
-    const chunk = fileBuffer.slice(offset, offset + CHUNK_SIZE);
-    targetPeer.dc.send(chunk);
-    offset += chunk.byteLength;
+  while (offset < file.size) {
+    if (isP2P) {
+      if (targetPeer.dc.bufferedAmount > BUFFER_THRESHOLD) {
+        await new Promise(resolve => {
+          targetPeer.dc.onbufferedamountlow = () => {
+            targetPeer.dc.onbufferedamountlow = null;
+            resolve();
+          };
+        });
+      }
+      const chunk = fileBuffer.slice(offset, offset + chunkSize);
+      targetPeer.dc.send(chunk);
+      offset += chunk.byteLength;
+    } else {
+      const chunk = fileBuffer.slice(offset, offset + chunkSize);
+      const chunkArray = Array.from(new Uint8Array(chunk));
+      sendSignalingMessage(currentSignalingTopic, {
+        type: 'RELAY_CHUNK',
+        targetPeerId: targetPeerId,
+        fromPeerId: myPeerId,
+        chunk: chunkArray
+      });
+      offset += chunk.byteLength;
+      await new Promise(r => setTimeout(r, 6));
+    }
 
     updateTransferProgress(offset, file.size);
   }
 
-  targetPeer.dc.send(JSON.stringify({
+  sendPeerAppMessage(targetPeerId, {
     type: 'FILE_END',
     sha256: sha256
-  }));
+  });
 
   addTransferToHistory({
     name: file.name,

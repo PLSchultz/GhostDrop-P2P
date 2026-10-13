@@ -9,6 +9,7 @@ import socket
 import threading
 import webbrowser
 import argparse
+import json
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 import mimetypes
 
@@ -31,12 +32,22 @@ else:
 STATIC_DIR = os.path.join(BASE_DIR, 'static')
 
 
+def get_local_ip():
+    """Determine the machine's LAN IP address."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
 def find_available_port(start_port=49152, max_attempts=100):
     """Find a free local TCP port."""
     for port in range(start_port, start_port + max_attempts):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('127.0.0.1', port))
+                s.bind(('0.0.0.0', port))
                 return port
         except OSError:
             continue
@@ -46,6 +57,18 @@ def find_available_port(start_port=49152, max_attempts=100):
 class GhostDropHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=STATIC_DIR, **kwargs)
+
+    def do_GET(self):
+        if self.path == '/api/info':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            lan_ip = get_local_ip()
+            info = json.dumps({"lan_ip": lan_ip, "port": self.server.server_port})
+            self.wfile.write(info.encode('utf-8'))
+            return
+        super().do_GET()
 
     def do_POST(self):
         if self.path == '/api/shutdown':
@@ -82,7 +105,7 @@ def main():
     parser = argparse.ArgumentParser(description="GhostDrop P2P - Transferencia de Arquivos Sem Rastros")
     parser.add_argument("--port", type=int, default=None, help="Porta para o servidor local")
     parser.add_argument("--no-browser", action="store_true", help="Nao abrir o navegador automaticamente")
-    parser.add_argument("--host", default="127.0.0.1", help="Endereco de escuta (padrao: 127.0.0.1)")
+    parser.add_argument("--host", default="0.0.0.0", help="Endereco de escuta (padrao: 0.0.0.0)")
     args = parser.parse_args()
 
     port = args.port or find_available_port()
@@ -95,17 +118,22 @@ def main():
         print(f"[ERRO] Falha ao iniciar na porta {port}: {e}")
         sys.exit(1)
 
-    url = f"http://{host}:{port}"
+    lan_ip = get_local_ip()
+    local_url = f"http://127.0.0.1:{port}"
+    lan_url = f"http://{lan_ip}:{port}"
+
     print("=" * 60)
     print("   [GhostDrop P2P] - Transferencia Segura Sem Rastros")
     print("=" * 60)
-    print(f"[*] Servidor local ativo em: {url}")
-    print("[*] Modo: Zero-Storage / WebRTC P2P Direto")
+    print(f"[*] Servidor local ativo em: {local_url}")
+    if lan_ip != "127.0.0.1":
+        print(f"[*] Acesso na rede local (Wi-Fi): {lan_url}")
+    print("[*] Modo: Zero-Storage / WebRTC P2P Direto + Fallback E2EE")
     print("[*] Pressione Ctrl+C ou clique em 'Encerrar & Limpar' na interface para sair.")
     print("=" * 60)
 
     if not args.no_browser:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        threading.Timer(0.6, lambda: webbrowser.open(local_url)).start()
 
     try:
         httpd.serve_forever()
