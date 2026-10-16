@@ -24,18 +24,24 @@ tc.js, ui.js.
 - [ ] Refactor DOM manipulation into ui.js (participants list, modals, toasts).
 - [ ] Refactor WebRTC signalling, ICE handling, fallback-relay into 
 tc.js.
-- [ ] Extract cryptographic helpers (deriveKey, encrypt/decrypt, hash) into crypto.js.
-- [ ] Move generic helpers (formatBytes, formatTime, generateRandomCode, etc.) into utils.js.
+- [x] Extract cryptographic helpers (deriveKey, encrypt/decrypt, hash) into crypto.js.
+- [x] Move generic helpers (formatBytes, formatTime, generateRandomCode, etc.) into utils.js.
 
 ## CI / Build
-- [ ] Add 
-equirements.txt / pyproject.toml.
-- [ ] Update uild.bat to use version from manifest.
+- [x] Add requirements.txt / pyproject.toml.
+- [x] Update build.bat to use version from manifest.
 - [ ] Create GitHub Actions workflow for lint, test, and build.
 
 ## Documentation
-- [ ] Expand README with contribution guide, architecture diagram (Mermaid), and API reference.
+- [x] Expand README with contribution guide, architecture diagram (Mermaid), and API reference.
 - [ ] Generate changelog automatically from tags.
 
 ---
 *Prioridade:* alta para logging e modulariza��o, m�dia para CI e documenta��o.
+## Proximos passos (modularizacao frontend)
+- [ ] Refatorar app.js para importar helpers de utils.js (remover duplicatas).
+- [ ] Refatorar app.js para importar helpers de crypto.js (remover duplicatas).
+- [ ] Criar ui.js com toda a manipulacao de DOM (participants list, modals, toasts, chat bubbles).
+- [ ] Criar rtc.js com WebRTC signaling, ICE handling e fallback relay.
+- [ ] Criar entry point app.js que importa os modulos (type=module).
+- [ ] Mover todas as variaveis globais para namespace ou module scope.

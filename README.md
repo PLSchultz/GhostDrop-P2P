@@ -139,3 +139,100 @@ O script criará o executável otimizado em `dist/GhostDrop-P2P.exe`.
 ## 📄 Licença
 
 Distribuído sob a licença **MIT**. Veja o arquivo `LICENSE` para mais detalhes.
+
+---
+
+## Architecture Diagram
+
+```mermaid
+flowchart TD
+    subgraph "User Device A"
+        UA_Browser["Browser\n(index.html + app.js)"]
+        UA_Server["Local HTTP Server\n(main.py :49152+)"]
+        UA_Browser <-->|localhost| UA_Server
+    end
+
+    subgraph "User Device B"
+        UB_Browser["Browser\n(index.html + app.js)"]
+        UB_Server["Local HTTP Server\n(main.py :49152+)"]
+        UB_Browser <-->|localhost| UB_Server
+    end
+
+    subgraph "Signaling Layer (ephemeral, E2EE)"
+        MQTT["MQTT Broker\n(emqx.io / hivemq)\nWSS encrypted topic"]
+    end
+
+    subgraph "STUN"
+        STUN["STUN Servers\n(Google / Cloudflare)"]
+    end
+
+    UA_Browser -- "AES-256-GCM\nSDP Offer/Answer\nICE Candidates" --> MQTT
+    MQTT -- "AES-256-GCM\nSignaling Messages" --> UB_Browser
+
+    UA_Browser -. "STUN probe" .-> STUN
+    UB_Browser -. "STUN probe" .-> STUN
+
+    UA_Browser <== "WebRTC DataChannel\nDTLS 1.3 / SCTP\n(files + chat, direct P2P)" ==> UB_Browser
+```
+
+> **Zero-storage guarantee**: the signaling broker receives only encrypted ciphertext
+> and holds no session state. All file bytes flow exclusively over the WebRTC
+> DataChannel, never touching any server.
+
+---
+
+## API Reference
+
+The local HTTP server (`main.py`) exposes three JSON endpoints on `http://127.0.0.1:<port>`.
+
+### `GET /api/health`
+
+Returns server liveness status and current version.
+
+**Response `200 OK`**
+```json
+{ "status": "ok", "version": "1.1.0" }
+```
+
+---
+
+### `GET /api/info`
+
+Returns the machine LAN IP and bound port (used by the frontend to build QR-code URLs).
+
+**Response `200 OK`**
+```json
+{ "lan_ip": "192.168.1.42", "port": 49152 }
+```
+
+---
+
+### `POST /api/shutdown`
+
+Triggers a graceful server shutdown and window close (used by the "Encerrar & Limpar" panic button).
+
+**Response `200 OK`**
+```json
+{ "status": "shutting_down" }
+```
+
+After ~400 ms the server calls `httpd.shutdown()`, runs the `finally` cleanup block in `main()`, and exits with code `0`.
+
+---
+
+## Contributing
+
+1. Fork the repository.
+2. Create a feature branch: `git checkout -b feat/my-feature`.
+3. Install dependencies: `pip install -r requirements.txt`.
+4. Make your changes and ensure `python main.py` starts cleanly.
+5. Open a Pull Request against `main`.
+
+### Code style
+
+| Layer | Convention |
+|---|---|
+| Python | PEP 8, Google-style docstrings, type hints required |
+| JavaScript | ES2021+, JSDoc comments on exported functions |
+| CSS | BEM-lite naming, CSS custom properties for theming |
+
