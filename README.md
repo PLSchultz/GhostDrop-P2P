@@ -20,7 +20,16 @@ Disponível tanto na **Web (acesso instantâneo sem instalação)** quanto como 
 - Topologia em **malha completa descentralizada (Full Mesh)**: cada dispositivo conecta-se diretamente a todos os outros participantes via canais WebRTC independentes.
 - Notificações automáticas de entrada e saída de membros na sala.
 
-### 🏷️ 2. Sistema de Apelidos Personalizados (Nicknames)
+### 📹 2. Chamadas de Vídeo e Áudio P2P (Estilo Google Meet)
+- **Conversa em Tempo Real**: Áudio e vídeo em alta definição transmitidos ponto a ponto entre todos os participantes da sala.
+- **Controles Completos**:
+  - 🎙️ **Microfone**: Mute/Unmute instantâneo (com atalho `Ctrl+D`).
+  - 📹 **Câmera**: Ligar/Desligar vídeo (com atalho `Ctrl+E`), com fallback para avatar dinâmico estilizado.
+  - 🖥️ **Compartilhamento de Tela**: Apresente sua tela ou janela para a sala com um clique.
+  - 🟢 **Indicador de Voz Ativa**: Borda e anel esmeralda pulsante quando alguém está falando (Web Audio API Analyser).
+  - 🔲 **Modo Cinema & Visualização Dinâmica**: Grade responsiva adaptativa (1 a múltiplos participantes).
+
+### 🏷️ 3. Sistema de Apelidos Personalizados (Nicknames)
 - Escolha e edite seu **apelido (nickname)** a qualquer momento diretamente na interface.
 - Identificação visual imediata de quem enviou cada mensagem e arquivo com avatares e paletas de cores dinâmicas.
 - Indicador de digitação em tempo real: saiba quem está digitando no grupo.

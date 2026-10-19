@@ -11,6 +11,16 @@
 - [x] Add version constant __version__ and display on startup.
 - [x] Add robust error handling for HTTP routes (try/except, proper status codes).
 
+## Video & Audio Conference (Google Meet Style)
+- [x] Integrate WebRTC MediaStream transceivers (Audio + Video) into mesh connections.
+- [x] Build Google Meet style floating control toolbar (Mute, Camera Toggle, Screen Sharing, Hangup).
+- [x] Implement dynamic Video Grid with automatic layout adaptation for 1 to N participants.
+- [x] Add Avatar placeholder when video is off, showing custom nickname initials and dynamic colors.
+- [x] Implement Web Audio API Analyser for real-time speaking indicators (pulsing emerald glow ring).
+- [x] Synchronize media state across peers via DataChannel and signaling fallback.
+- [x] Add keyboard shortcuts (Ctrl+D for Mic, Ctrl+E for Camera).
+- [x] Add Theater Mode and Collapsible Panel controls.
+
 ## Frontend (static/app.js ? modules)
 - [ ] Split into modules: utils.js, crypto.js, 
 tc.js, ui.js.
