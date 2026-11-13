@@ -24,8 +24,8 @@ let currentBrokerIndex = 0;
 
 const CHUNK_SIZE = 256 * 1024;          // 256 KB per WebRTC send
 const READ_AHEAD_SIZE = 16 * 1024 * 1024; // 16 MB disk read block (pipeline read-ahead)
-const BUFFER_HIGH = 8 * 1024 * 1024;    // 8 MB: stop sending above this
-const BUFFER_LOW = 2 * 1024 * 1024;     // 2 MB: resume sending below this
+const BUFFER_HIGH = 64 * 1024 * 1024;   // 64 MB: keep SCTP well-fed for max throughput
+const BUFFER_LOW = 1 * 1024 * 1024;     // 1 MB: resume sending early to avoid stalls
 
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
@@ -1216,10 +1216,18 @@ function handleIncomingChunk(chunkBuffer) {
   }
 }
 
-// Handle Relayed File Chunk
+// Handle Relayed File Chunk (supports base64 and legacy Array format)
 function handleRelayChunk(msg) {
-  if (!msg.chunk) return;
-  const chunkBuffer = new Uint8Array(msg.chunk).buffer;
+  let chunkBuffer;
+  if (msg.b64) {
+    // base64 encoded (new, compact format)
+    chunkBuffer = base64ToUint8(msg.b64).buffer;
+  } else if (msg.chunk) {
+    // Legacy Array.from format
+    chunkBuffer = new Uint8Array(msg.chunk).buffer;
+  } else {
+    return;
+  }
   handleIncomingChunk(chunkBuffer);
 }
 
@@ -1536,8 +1544,10 @@ async function startSendingNextQueuedFile(targetPeerId) {
   openTransferModal(file.name, file.size, 'Enviando Arquivo...');
 
   if (targetPeer.mode === 'p2p' && targetPeer.dc && targetPeer.dc.readyState === 'open') {
+    console.log(`[Transfer] Enviando "${file.name}" via P2P DataChannel direto`);
     await sendFileOverDataChannel(targetPeer.dc, file, sha256);
   } else {
+    console.log(`[Transfer] Enviando "${file.name}" via Relay MQTT (mais lento)`);
     await sendFileOverRelay(targetPeerId, file, sha256);
   }
 
@@ -1550,10 +1560,10 @@ async function startSendingNextQueuedFile(targetPeerId) {
   });
 }
 
-// Streaming Transfer over WebRTC DataChannel (Pipeline Read-Ahead)
-// Reads 16 MB blocks from disk → slices synchronously into 256 KB chunks → sends over SCTP
+// Streaming Transfer over WebRTC DataChannel (Pipeline Read-Ahead + Zero-Copy Views)
+// Reads 16 MB blocks from disk → sends 256 KB views (zero-copy) over SCTP
 // Pre-reads the next block while the current one is being sent (double-buffer pipeline)
-// Max RAM: ~32-48 MB (current block + next block + SCTP buffer)
+// Max RAM: ~96 MB (2 × 16 MB blocks + 64 MB SCTP buffer)
 async function sendFileOverDataChannel(dc, file, sha256) {
   try {
     dc.bufferedAmountLowThreshold = BUFFER_LOW;
@@ -1606,7 +1616,7 @@ async function sendFileOverDataChannel(dc, file, sha256) {
 
     async function sendSlice() {
       while (currentBlock) {
-        // Send chunks from the current in-memory block (synchronous slicing = fast!)
+        // Send chunks from the current in-memory block using zero-copy Uint8Array VIEWS
         while (blockOffset < currentBlock.byteLength) {
           if (isAborted || currentTransferAborted) {
             resolve();
@@ -1622,19 +1632,22 @@ async function sendFileOverDataChannel(dc, file, sha256) {
             return;
           }
 
-          const end = Math.min(blockOffset + CHUNK_SIZE, currentBlock.byteLength);
-          const chunk = currentBlock.slice(blockOffset, end);
+          const remaining = currentBlock.byteLength - blockOffset;
+          const chunkLen = Math.min(CHUNK_SIZE, remaining);
+
+          // Zero-copy VIEW into the existing ArrayBuffer — no allocation, no memcpy!
+          const view = new Uint8Array(currentBlock, blockOffset, chunkLen);
 
           try {
-            dc.send(chunk);
+            dc.send(view);
           } catch (err) {
             console.error('[DataChannel] Erro ao enviar chunk:', err);
             resolve();
             return;
           }
 
-          blockOffset += chunk.byteLength;
-          totalSent += chunk.byteLength;
+          blockOffset += chunkLen;
+          totalSent += chunkLen;
           updateTransferProgress(totalSent, totalBytes);
         }
 
@@ -1669,7 +1682,7 @@ async function sendFileOverDataChannel(dc, file, sha256) {
   });
 }
 
-// Fallback Relay File Sending (Pipeline Read-Ahead, 2 MB blocks)
+// Fallback Relay File Sending (base64 encoded, read-ahead blocks)
 async function sendFileOverRelay(targetPeerId, file, sha256) {
   sendPeerAppMessage(targetPeerId, {
     type: 'FILE_META',
@@ -1681,8 +1694,8 @@ async function sendFileOverRelay(targetPeerId, file, sha256) {
   });
 
   const totalBytes = file.size;
-  const relayChunkSize = 64 * 1024; // 64 KB for MQTT payload safety
-  const relayBlockSize = 2 * 1024 * 1024; // 2 MB read-ahead blocks for relay
+  const relayChunkSize = 96 * 1024; // 96 KB chunks → ~128 KB base64 (MQTT safe)
+  const relayBlockSize = 4 * 1024 * 1024; // 4 MB read-ahead blocks for relay
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
@@ -1694,30 +1707,35 @@ async function sendFileOverRelay(targetPeerId, file, sha256) {
   while (fileOffset < totalBytes) {
     if (currentTransferAborted) break;
 
-    // Read a 2 MB block from disk
+    // Read a 4 MB block from disk
     const blockEnd = Math.min(fileOffset + relayBlockSize, totalBytes);
     const block = await file.slice(fileOffset, blockEnd).arrayBuffer();
     fileOffset = blockEnd;
 
     if (currentTransferAborted) break;
 
-    // Slice the block into 64 KB relay chunks (synchronous = fast)
+    // Slice the block into relay chunks using zero-copy views
     let blockOffset = 0;
     while (blockOffset < block.byteLength) {
       if (currentTransferAborted) break;
 
-      const end = Math.min(blockOffset + relayChunkSize, block.byteLength);
-      const chunk = block.slice(blockOffset, end);
+      const remaining = block.byteLength - blockOffset;
+      const chunkLen = Math.min(relayChunkSize, remaining);
+      const view = new Uint8Array(block, blockOffset, chunkLen);
+
+      // base64 encode (3× more compact than Array.from JSON numbers!)
+      const b64 = uint8ToBase64(view);
 
       sendPeerAppMessage(targetPeerId, {
         type: 'FILE_CHUNK_RELAY',
-        chunk: Array.from(new Uint8Array(chunk))
+        b64: b64
       });
 
-      blockOffset += chunk.byteLength;
-      totalSent += chunk.byteLength;
+      blockOffset += chunkLen;
+      totalSent += chunkLen;
       updateTransferProgress(totalSent, totalBytes);
-      await new Promise(r => setTimeout(r, 10));
+      // Yield briefly to let MQTT flush and keep the UI responsive
+      await new Promise(r => setTimeout(r, 5));
     }
   }
 
@@ -1728,6 +1746,29 @@ async function sendFileOverRelay(targetPeerId, file, sha256) {
     });
     onSendComplete(sha256);
   }
+}
+
+// Fast Uint8Array → base64 (uses built-in btoa)
+function uint8ToBase64(uint8arr) {
+  let binary = '';
+  const len = uint8arr.byteLength;
+  // Process in 8KB sub-chunks to avoid call stack limits on btoa
+  for (let i = 0; i < len; i += 8192) {
+    const subLen = Math.min(8192, len - i);
+    binary += String.fromCharCode.apply(null, uint8arr.subarray(i, i + subLen));
+  }
+  return btoa(binary);
+}
+
+// Fast base64 → Uint8Array
+function base64ToUint8(b64) {
+  const binary = atob(b64);
+  const len = binary.length;
+  const arr = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    arr[i] = binary.charCodeAt(i);
+  }
+  return arr;
 }
 
 function onSendComplete(sha256) {
@@ -1786,14 +1827,42 @@ function renderTransfersList() {
   });
 }
 
-// Update UI Progress Metrics
+// Update UI Progress Metrics (throttled — max once per 150ms to not bottleneck the send loop)
+let _progressLastUpdate = 0;
+let _progressRafPending = false;
+let _progressLatestCurrent = 0;
+let _progressLatestTotal = 0;
+
 function updateTransferProgress(current, total) {
+  _progressLatestCurrent = current;
+  _progressLatestTotal = total;
+
+  const now = Date.now();
+  if (now - _progressLastUpdate < 150) {
+    // Schedule a deferred update so we always show the final state
+    if (!_progressRafPending) {
+      _progressRafPending = true;
+      requestAnimationFrame(() => {
+        _progressRafPending = false;
+        _flushTransferProgress();
+      });
+    }
+    return;
+  }
+  _flushTransferProgress();
+}
+
+function _flushTransferProgress() {
+  const current = _progressLatestCurrent;
+  const total = _progressLatestTotal;
+  _progressLastUpdate = Date.now();
+
   const percent = Math.min(100, Math.round((current / total) * 100));
   progressBarFill.style.width = percent + '%';
   transferPercent.textContent = percent + '%';
   transferBytes.textContent = `${formatBytes(current)} / ${formatBytes(total)}`;
 
-  const now = Date.now();
+  const now = _progressLastUpdate;
   const timeDelta = (now - lastTime) / 1000;
   if (timeDelta >= 0.5) {
     const bytesDelta = current - lastBytes;
