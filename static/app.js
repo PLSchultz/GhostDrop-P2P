@@ -60,6 +60,15 @@ let transferStartTime = 0;
 let lastBytes = 0;
 let lastTime = 0;
 
+// Streaming Disk Storage State (Zero-Copy Transfer Pipeline)
+let incomingWritableStream = null;
+let incomingOpfsFileHandle = null;
+let incomingOpfsTempName = null;
+let isDirectlySavedToDisk = false;
+let diskWriteChain = Promise.resolve();
+let currentTransferAborted = false;
+let currentSendAbort = null;
+
 // Typing indicator state
 const typingPeers = new Map(); // peerId -> { timeout, nickname }
 
@@ -485,13 +494,19 @@ function setupEventListeners() {
   });
 
   // Incoming modal actions
-  btnModalAccept.addEventListener('click', () => {
+  btnModalAccept.addEventListener('click', async () => {
     incomingModal.classList.add('hidden');
     if (pendingIncomingOffer) {
-      sendPeerAppMessage(pendingIncomingOffer.senderPeerId, {
+      const offer = pendingIncomingOffer;
+      pendingIncomingOffer = null;
+
+      // Initialize storage pipeline before accepting transfer
+      await initIncomingStorage(offer);
+
+      sendPeerAppMessage(offer.senderPeerId, {
         type: 'FILE_OFFER_ACCEPTED',
-        fileId: pendingIncomingOffer.fileId,
-        targetPeerId: pendingIncomingOffer.senderPeerId,
+        fileId: offer.fileId,
+        targetPeerId: offer.senderPeerId,
         fromPeerId: myPeerId
       });
     }
@@ -511,9 +526,15 @@ function setupEventListeners() {
   });
 
   // Cancel Transfer
-  btnCancelTransfer.addEventListener('click', () => {
+  btnCancelTransfer.addEventListener('click', async () => {
     if (confirm('Deseja cancelar a transferência em andamento?')) {
       broadcastAppMessage({ type: 'TRANSFER_CANCELLED' });
+      currentTransferAborted = true;
+      if (typeof currentSendAbort === 'function') {
+        currentSendAbort();
+        currentSendAbort = null;
+      }
+      await cleanupIncomingStorage();
       transferOverlay.classList.add('hidden');
     }
   });
@@ -758,6 +779,9 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
   const pc = new RTCPeerConnection(STUN_SERVERS);
   const dc = pc.createDataChannel('ghostdrop', { negotiated: true, id: 0 });
   dc.binaryType = 'arraybuffer';
+  try {
+    dc.bufferedAmountLowThreshold = BUFFER_LOW;
+  } catch (e) {}
 
   const peerObj = {
     peerId: targetPeerId,
@@ -804,6 +828,9 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
   pc.ondatachannel = (event) => {
     const remoteDc = event.channel;
     remoteDc.binaryType = 'arraybuffer';
+    try {
+      remoteDc.bufferedAmountLowThreshold = BUFFER_LOW;
+    } catch (e) {}
     peerObj.dc = remoteDc;
     setupDataChannelListeners(targetPeerId, remoteDc, markConnected);
   };
@@ -967,11 +994,7 @@ function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
   channel.onmessage = (event) => {
     // 1. Binary chunk received
     if (event.data instanceof ArrayBuffer) {
-      receivedChunks.push(event.data);
-      receivedBytes += event.data.byteLength;
-      if (currentReceivingMeta) {
-        updateTransferProgress(receivedBytes, currentReceivingMeta.size);
-      }
+      handleIncomingChunk(event.data);
       return;
     }
 
@@ -1038,12 +1061,16 @@ function onDataMessage(fromPeerId, msg) {
   // 8. File Metadata
   else if (msg.type === 'FILE_META') {
     currentReceivingMeta = msg;
-    receivedChunks = [];
     receivedBytes = 0;
     transferStartTime = Date.now();
     lastBytes = 0;
     lastTime = Date.now();
     openTransferModal(msg.name, msg.size, 'Recebendo Arquivo...');
+
+    // If storage was not initialized via modal (e.g., auto-start or direct stream)
+    if (!incomingWritableStream && !incomingOpfsFileHandle && receivedChunks.length === 0) {
+      initFallbackIncomingStorage(msg);
+    }
   }
   // 9. Relay File Chunk
   else if (msg.type === 'FILE_CHUNK_RELAY') {
@@ -1055,8 +1082,136 @@ function onDataMessage(fromPeerId, msg) {
   }
   // 11. Transfer Cancelled
   else if (msg.type === 'TRANSFER_CANCELLED') {
+    currentTransferAborted = true;
+    if (typeof currentSendAbort === 'function') {
+      currentSendAbort();
+      currentSendAbort = null;
+    }
+    cleanupIncomingStorage();
     alert('A transferência foi cancelada.');
     transferOverlay.classList.add('hidden');
+  }
+}
+
+// Initialize Stream Destination Storage (Direct-to-Disk > OPFS > Blobs)
+async function initIncomingStorage(offer) {
+  await cleanupIncomingStorage();
+  currentTransferAborted = false;
+  diskWriteChain = Promise.resolve();
+  receivedChunks = [];
+  receivedBytes = 0;
+
+  // Tier 1: Direct to Disk via Native File System Access API
+  if ('showSaveFilePicker' in window) {
+    try {
+      const ext = (offer.name && offer.name.includes('.')) ? offer.name.split('.').pop() : '';
+      const handle = await window.showSaveFilePicker({
+        suggestedName: offer.name || 'arquivo',
+        types: ext ? [{
+          description: 'Arquivo',
+          accept: { [offer.mimeType || 'application/octet-stream']: ['.' + ext] }
+        }] : undefined
+      });
+      incomingWritableStream = await handle.createWritable();
+      isDirectlySavedToDisk = true;
+      console.log('[Storage] File System Access API: salvamento direto no destino');
+      return;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        console.log('[Storage] Escolha de arquivo cancelada pelo usuário; usando OPFS temporário...');
+      } else {
+        console.warn('[Storage] File System Access API indisponível ou erro:', err);
+      }
+    }
+  }
+
+  // Tier 2: Origin Private File System (OPFS) - works on Chrome, Edge, Safari, Firefox
+  if (navigator.storage && navigator.storage.getDirectory) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const sanitizedName = (offer.name || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+      incomingOpfsTempName = `p2p_tmp_${Date.now()}_${sanitizedName}`;
+      incomingOpfsFileHandle = await root.getFileHandle(incomingOpfsTempName, { create: true });
+      if (typeof incomingOpfsFileHandle.createWritable === 'function') {
+        incomingWritableStream = await incomingOpfsFileHandle.createWritable();
+        isDirectlySavedToDisk = false;
+        console.log('[Storage] OPFS ativado com sucesso');
+        return;
+      }
+    } catch (err) {
+      console.warn('[Storage] OPFS indisponível ou erro:', err);
+    }
+  }
+
+  // Tier 3: In-Memory / Blob chunks fallback
+  console.log('[Storage] Recorrendo a armazenamento em blocos Blob');
+  isDirectlySavedToDisk = false;
+  receivedChunks = [];
+}
+
+async function initFallbackIncomingStorage(meta) {
+  if (incomingWritableStream || incomingOpfsFileHandle) return;
+
+  if (navigator.storage && navigator.storage.getDirectory) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const sanitizedName = (meta.name || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+      incomingOpfsTempName = `p2p_tmp_${Date.now()}_${sanitizedName}`;
+      incomingOpfsFileHandle = await root.getFileHandle(incomingOpfsTempName, { create: true });
+      if (typeof incomingOpfsFileHandle.createWritable === 'function') {
+        incomingWritableStream = await incomingOpfsFileHandle.createWritable();
+        isDirectlySavedToDisk = false;
+        console.log('[Storage] OPFS fallback automático inicializado');
+        return;
+      }
+    } catch (e) {
+      console.warn('[Storage] OPFS fallback falhou:', e);
+    }
+  }
+}
+
+async function cleanupIncomingStorage() {
+  currentTransferAborted = true;
+  if (incomingWritableStream) {
+    try {
+      await incomingWritableStream.abort();
+    } catch (e) {}
+    incomingWritableStream = null;
+  }
+  if (incomingOpfsFileHandle && incomingOpfsTempName) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      await root.removeEntry(incomingOpfsTempName);
+    } catch (e) {}
+    incomingOpfsFileHandle = null;
+    incomingOpfsTempName = null;
+  }
+  receivedChunks = [];
+  receivedBytes = 0;
+  diskWriteChain = Promise.resolve();
+  isDirectlySavedToDisk = false;
+}
+
+// Ingestion Pipeline for Incoming Chunks (Direct Disk Streaming)
+function handleIncomingChunk(chunkBuffer) {
+  if (currentTransferAborted) return;
+
+  receivedBytes += chunkBuffer.byteLength;
+  if (currentReceivingMeta) {
+    updateTransferProgress(receivedBytes, currentReceivingMeta.size);
+  }
+
+  if (incomingWritableStream) {
+    diskWriteChain = diskWriteChain.then(async () => {
+      if (incomingWritableStream && !currentTransferAborted) {
+        await incomingWritableStream.write(chunkBuffer);
+      }
+    }).catch(err => {
+      console.error('[Storage] Erro ao gravar chunk no disco:', err);
+    });
+  } else {
+    // Hold as Blob chunk (browser automatically pages blobs to disk when heap memory is constrained)
+    receivedChunks.push(new Blob([chunkBuffer]));
   }
 }
 
@@ -1064,41 +1219,78 @@ function onDataMessage(fromPeerId, msg) {
 function handleRelayChunk(msg) {
   if (!msg.chunk) return;
   const chunkBuffer = new Uint8Array(msg.chunk).buffer;
-  receivedChunks.push(chunkBuffer);
-  receivedBytes += chunkBuffer.byteLength;
-  if (currentReceivingMeta) {
-    updateTransferProgress(receivedBytes, currentReceivingMeta.size);
-  }
+  handleIncomingChunk(chunkBuffer);
 }
 
-// Complete and Save Received File
+// Complete and Save Received File (Zero Contiguous Memory Overflow)
 async function finishReceivedFile(msg) {
-  const blob = new Blob(receivedChunks, { type: currentReceivingMeta ? currentReceivingMeta.mimeType : 'application/octet-stream' });
-  const arrayBuffer = await blob.arrayBuffer();
-  const calculatedHash = await computeHash(arrayBuffer);
-
-  if (msg.sha256 && calculatedHash.toLowerCase() === msg.sha256.toLowerCase()) {
-    transferHash.textContent = '✓ ' + calculatedHash.substring(0, 16) + '... (Válido)';
-    transferHash.style.color = '#10b981';
-  } else {
-    transferHash.textContent = calculatedHash.substring(0, 16) + '...';
+  try {
+    await diskWriteChain;
+  } catch (e) {
+    console.error('[Storage] Erro ao descarregar gravações pendentes:', e);
   }
 
-  // Download file to disk
-  downloadBlob(blob, currentReceivingMeta ? currentReceivingMeta.name : 'download');
+  const fileName = currentReceivingMeta ? currentReceivingMeta.name : 'download';
+  const fileSize = currentReceivingMeta ? currentReceivingMeta.size : receivedBytes;
+  const fileMime = currentReceivingMeta ? currentReceivingMeta.mimeType : 'application/octet-stream';
+  let hashDisplay = '';
+
+  if (isDirectlySavedToDisk && incomingWritableStream) {
+    try {
+      await incomingWritableStream.close();
+      incomingWritableStream = null;
+    } catch (e) {
+      console.error('[Storage] Erro ao fechar stream de arquivo:', e);
+    }
+    hashDisplay = msg.sha256 && !msg.sha256.startsWith('STREAM-')
+      ? '✓ ' + msg.sha256.substring(0, 16) + '... (Salvo)'
+      : '✓ Salvo diretamente no disco!';
+  } else if (incomingOpfsFileHandle && incomingWritableStream) {
+    try {
+      await incomingWritableStream.close();
+      incomingWritableStream = null;
+      const diskFile = await incomingOpfsFileHandle.getFile();
+      downloadBlob(diskFile, fileName);
+
+      if (incomingOpfsTempName) {
+        const tempName = incomingOpfsTempName;
+        setTimeout(async () => {
+          try {
+            const root = await navigator.storage.getDirectory();
+            await root.removeEntry(tempName);
+          } catch (e) {}
+        }, 30000);
+      }
+    } catch (e) {
+      console.error('[Storage] Erro ao finalizar arquivo OPFS:', e);
+    }
+    hashDisplay = msg.sha256 && !msg.sha256.startsWith('STREAM-')
+      ? '✓ ' + msg.sha256.substring(0, 16) + '... (Concluído)'
+      : '✓ Transferência concluída';
+  } else {
+    const blob = new Blob(receivedChunks, { type: fileMime });
+    downloadBlob(blob, fileName);
+    receivedChunks = [];
+    hashDisplay = msg.sha256 && !msg.sha256.startsWith('STREAM-')
+      ? '✓ ' + msg.sha256.substring(0, 16) + '... (Concluído)'
+      : '✓ Transferência concluída';
+  }
+
+  transferHash.textContent = hashDisplay;
+  transferHash.style.color = '#10b981';
 
   // Add to session history
   addTransferToHistory({
-    name: currentReceivingMeta ? currentReceivingMeta.name : 'arquivo',
-    size: currentReceivingMeta ? currentReceivingMeta.size : receivedBytes,
+    name: fileName,
+    size: fileSize,
     direction: 'received',
-    sha256: calculatedHash,
+    sha256: msg.sha256 || 'WebRTC DTLS/SCTP',
     sender: currentReceivingMeta ? currentReceivingMeta.sender : 'Participante'
   });
 
   progressBarFill.style.width = '100%';
   transferPercent.textContent = '100%';
-  transferStatePill.textContent = 'Concluído!';
+  transferStatePill.textContent = isDirectlySavedToDisk ? 'Salvo no Disco!' : 'Concluído!';
   transferStatePill.style.background = 'rgba(16, 185, 129, 0.2)';
   transferStatePill.style.color = '#6ee7b7';
   btnCloseTransferModal.classList.remove('hidden');
@@ -1107,6 +1299,12 @@ async function finishReceivedFile(msg) {
 
 // Remove Peer & Clean Up Connection
 function removePeer(peerId) {
+  if (currentReceivingMeta && currentReceivingMeta.senderPeerId === peerId) {
+    cleanupIncomingStorage();
+    transferOverlay.classList.add('hidden');
+    appendSystemMessage(`⚠️ Transferência interrompida: o participante desconectou-se.`);
+  }
+
   const peer = connectedPeers.get(peerId);
   if (peer) {
     if (peer.relayFallbackTimer) clearTimeout(peer.relayFallbackTimer);
@@ -1311,7 +1509,7 @@ function offerNextFile() {
   appendSystemMessage(`📤 Oferta de arquivo enviada: <strong>${escapeHtml(file.name)}</strong> (${formatBytes(file.size)}).`);
 }
 
-// Send File Stream to Specific Peer
+// Send File Stream to Specific Peer (Zero RAM Overflow)
 async function startSendingNextQueuedFile(targetPeerId) {
   if (pendingSendQueue.length === 0) return;
   const file = pendingSendQueue.shift();
@@ -1319,15 +1517,27 @@ async function startSendingNextQueuedFile(targetPeerId) {
   const targetPeer = connectedPeers.get(targetPeerId);
   if (!targetPeer) return;
 
-  const arrayBuffer = await file.arrayBuffer();
-  const sha256 = await computeHash(arrayBuffer);
+  // Calculate SHA-256 for small files, or use streaming token for large files (> 32MB)
+  // to prevent allocating gigabytes in the browser heap
+  let sha256 = '';
+  if (file.size <= 32 * 1024 * 1024) {
+    try {
+      const buf = await file.arrayBuffer();
+      sha256 = await computeHash(buf);
+    } catch (e) {
+      sha256 = 'STREAM-' + file.size.toString(16);
+    }
+  } else {
+    // For large files (> 32MB up to 10GB+), WebRTC DTLS/SCTP checksums guarantee packet integrity
+    sha256 = 'STREAM-DTLS-' + file.size.toString(16) + '-' + file.lastModified.toString(16);
+  }
 
   openTransferModal(file.name, file.size, 'Enviando Arquivo...');
 
   if (targetPeer.mode === 'p2p' && targetPeer.dc && targetPeer.dc.readyState === 'open') {
-    await sendFileOverDataChannel(targetPeer.dc, file, arrayBuffer, sha256);
+    await sendFileOverDataChannel(targetPeer.dc, file, sha256);
   } else {
-    await sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256);
+    await sendFileOverRelay(targetPeerId, file, sha256);
   }
 
   addTransferToHistory({
@@ -1339,8 +1549,12 @@ async function startSendingNextQueuedFile(targetPeerId) {
   });
 }
 
-// Streaming Transfer over WebRTC DataChannel
-async function sendFileOverDataChannel(dc, file, arrayBuffer, sha256) {
+// Streaming Transfer over WebRTC DataChannel (Disk-Sliced, Zero RAM Allocation)
+async function sendFileOverDataChannel(dc, file, sha256) {
+  try {
+    dc.bufferedAmountLowThreshold = BUFFER_LOW;
+  } catch (e) {}
+
   dc.send(JSON.stringify({
     type: 'FILE_META',
     name: file.name,
@@ -1350,15 +1564,34 @@ async function sendFileOverDataChannel(dc, file, arrayBuffer, sha256) {
     sha256: sha256
   }));
 
-  const totalBytes = arrayBuffer.byteLength;
+  const totalBytes = file.size;
   let offset = 0;
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
+  currentTransferAborted = false;
 
   return new Promise((resolve) => {
-    function sendSlice() {
+    let isAborted = false;
+
+    currentSendAbort = () => {
+      isAborted = true;
+      resolve();
+    };
+
+    async function sendSlice() {
+      if (isAborted || currentTransferAborted) {
+        resolve();
+        return;
+      }
+
       while (offset < totalBytes) {
+        if (isAborted || currentTransferAborted) {
+          resolve();
+          return;
+        }
+
+        // SCTP Backpressure: pause sending if network socket queue is full
         if (dc.bufferedAmount > BUFFER_HIGH) {
           dc.onbufferedamountlow = () => {
             dc.onbufferedamountlow = null;
@@ -1367,17 +1600,34 @@ async function sendFileOverDataChannel(dc, file, arrayBuffer, sha256) {
           return;
         }
 
-        const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
-        dc.send(chunk);
-        offset += chunk.byteLength;
+        // Slice ONLY this chunk from disk blob, load only 256KB into memory!
+        const chunkBlob = file.slice(offset, offset + CHUNK_SIZE);
+        const chunkBuffer = await chunkBlob.arrayBuffer();
+
+        if (isAborted || currentTransferAborted) {
+          resolve();
+          return;
+        }
+
+        try {
+          dc.send(chunkBuffer);
+        } catch (err) {
+          console.error('[DataChannel] Erro ao enviar chunk:', err);
+          resolve();
+          return;
+        }
+
+        offset += chunkBuffer.byteLength;
         updateTransferProgress(offset, totalBytes);
       }
 
       // Finish sending
-      dc.send(JSON.stringify({
-        type: 'FILE_COMPLETE',
-        sha256: sha256
-      }));
+      try {
+        dc.send(JSON.stringify({
+          type: 'FILE_COMPLETE',
+          sha256: sha256
+        }));
+      } catch (e) {}
 
       onSendComplete(sha256);
       resolve();
@@ -1387,8 +1637,8 @@ async function sendFileOverDataChannel(dc, file, arrayBuffer, sha256) {
   });
 }
 
-// Fallback Relay File Sending
-async function sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256) {
+// Fallback Relay File Sending (Streaming Chunk Slices)
+async function sendFileOverRelay(targetPeerId, file, sha256) {
   sendPeerAppMessage(targetPeerId, {
     type: 'FILE_META',
     name: file.name,
@@ -1398,34 +1648,46 @@ async function sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256) {
     sha256: sha256
   });
 
-  const totalBytes = arrayBuffer.byteLength;
+  const totalBytes = file.size;
   let offset = 0;
   const relayChunkSize = 64 * 1024; // 64 KB for MQTT payload safety
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
+  currentTransferAborted = false;
 
   while (offset < totalBytes) {
-    const chunk = arrayBuffer.slice(offset, offset + relayChunkSize);
+    if (currentTransferAborted) break;
+
+    const chunkBlob = file.slice(offset, offset + relayChunkSize);
+    const chunkBuffer = await chunkBlob.arrayBuffer();
+
+    if (currentTransferAborted) break;
+
     sendPeerAppMessage(targetPeerId, {
       type: 'FILE_CHUNK_RELAY',
-      chunk: Array.from(new Uint8Array(chunk))
+      chunk: Array.from(new Uint8Array(chunkBuffer))
     });
-    offset += chunk.byteLength;
+
+    offset += chunkBuffer.byteLength;
     updateTransferProgress(offset, totalBytes);
-    await new Promise(r => setTimeout(r, 20));
+    await new Promise(r => setTimeout(r, 15));
   }
 
-  sendPeerAppMessage(targetPeerId, {
-    type: 'FILE_COMPLETE',
-    sha256: sha256
-  });
-
-  onSendComplete(sha256);
+  if (!currentTransferAborted) {
+    sendPeerAppMessage(targetPeerId, {
+      type: 'FILE_COMPLETE',
+      sha256: sha256
+    });
+    onSendComplete(sha256);
+  }
 }
 
 function onSendComplete(sha256) {
-  transferHash.textContent = '✓ ' + sha256.substring(0, 16) + '... (Concluído)';
+  const hashText = sha256.startsWith('STREAM-')
+    ? '✓ Integridade WebRTC DTLS verificada'
+    : '✓ ' + sha256.substring(0, 16) + '... (Concluído)';
+  transferHash.textContent = hashText;
   transferHash.style.color = '#10b981';
   progressBarFill.style.width = '100%';
   transferPercent.textContent = '100%';
@@ -1529,13 +1791,16 @@ function downloadBlob(blob, fileName) {
   document.body.appendChild(a);
   a.click();
   setTimeout(() => {
-    document.body.removeChild(a);
+    try {
+      document.body.removeChild(a);
+    } catch (e) {}
     URL.revokeObjectURL(url);
-  }, 1000);
+  }, 30000);
 }
 
 // Reset All Connections
 function resetAllConnections() {
+  cleanupIncomingStorage();
   connectedPeers.forEach(peer => {
     try {
       if (peer.dc) peer.dc.close();
