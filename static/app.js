@@ -22,7 +22,8 @@ const MQTT_BROKERS = [
 ];
 let currentBrokerIndex = 0;
 
-const CHUNK_SIZE = 256 * 1024;          // 256 KB per chunk for high throughput
+const CHUNK_SIZE = 256 * 1024;          // 256 KB per WebRTC send
+const READ_AHEAD_SIZE = 16 * 1024 * 1024; // 16 MB disk read block (pipeline read-ahead)
 const BUFFER_HIGH = 8 * 1024 * 1024;    // 8 MB: stop sending above this
 const BUFFER_LOW = 2 * 1024 * 1024;     // 2 MB: resume sending below this
 
@@ -1549,7 +1550,10 @@ async function startSendingNextQueuedFile(targetPeerId) {
   });
 }
 
-// Streaming Transfer over WebRTC DataChannel (Disk-Sliced, Zero RAM Allocation)
+// Streaming Transfer over WebRTC DataChannel (Pipeline Read-Ahead)
+// Reads 16 MB blocks from disk → slices synchronously into 256 KB chunks → sends over SCTP
+// Pre-reads the next block while the current one is being sent (double-buffer pipeline)
+// Max RAM: ~32-48 MB (current block + next block + SCTP buffer)
 async function sendFileOverDataChannel(dc, file, sha256) {
   try {
     dc.bufferedAmountLowThreshold = BUFFER_LOW;
@@ -1565,11 +1569,32 @@ async function sendFileOverDataChannel(dc, file, sha256) {
   }));
 
   const totalBytes = file.size;
-  let offset = 0;
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
   currentTransferAborted = false;
+
+  // Read a block from the File blob on disk
+  function readBlock(startOffset) {
+    if (startOffset >= totalBytes) return Promise.resolve(null);
+    const end = Math.min(startOffset + READ_AHEAD_SIZE, totalBytes);
+    return file.slice(startOffset, end).arrayBuffer();
+  }
+
+  // Pre-read first block
+  let currentBlock = await readBlock(0);
+  if (!currentBlock) {
+    dc.send(JSON.stringify({ type: 'FILE_COMPLETE', sha256 }));
+    onSendComplete(sha256);
+    return;
+  }
+
+  let fileOffset = Math.min(READ_AHEAD_SIZE, totalBytes);
+  // Start pre-reading the second block (pipelining!)
+  let nextBlockPromise = readBlock(fileOffset);
+
+  let blockOffset = 0;
+  let totalSent = 0;
 
   return new Promise((resolve) => {
     let isAborted = false;
@@ -1580,48 +1605,55 @@ async function sendFileOverDataChannel(dc, file, sha256) {
     };
 
     async function sendSlice() {
+      while (currentBlock) {
+        // Send chunks from the current in-memory block (synchronous slicing = fast!)
+        while (blockOffset < currentBlock.byteLength) {
+          if (isAborted || currentTransferAborted) {
+            resolve();
+            return;
+          }
+
+          // SCTP backpressure: wait for the network to drain
+          if (dc.bufferedAmount > BUFFER_HIGH) {
+            dc.onbufferedamountlow = () => {
+              dc.onbufferedamountlow = null;
+              sendSlice();
+            };
+            return;
+          }
+
+          const end = Math.min(blockOffset + CHUNK_SIZE, currentBlock.byteLength);
+          const chunk = currentBlock.slice(blockOffset, end);
+
+          try {
+            dc.send(chunk);
+          } catch (err) {
+            console.error('[DataChannel] Erro ao enviar chunk:', err);
+            resolve();
+            return;
+          }
+
+          blockOffset += chunk.byteLength;
+          totalSent += chunk.byteLength;
+          updateTransferProgress(totalSent, totalBytes);
+        }
+
+        // Current block fully sent — swap in the pre-read next block
+        if (totalSent >= totalBytes) break;
+
+        currentBlock = await nextBlockPromise;
+        blockOffset = 0;
+        fileOffset += READ_AHEAD_SIZE;
+        // Pipeline: start reading the NEXT block while we send the one we just loaded
+        nextBlockPromise = readBlock(fileOffset);
+      }
+
       if (isAborted || currentTransferAborted) {
         resolve();
         return;
       }
 
-      while (offset < totalBytes) {
-        if (isAborted || currentTransferAborted) {
-          resolve();
-          return;
-        }
-
-        // SCTP Backpressure: pause sending if network socket queue is full
-        if (dc.bufferedAmount > BUFFER_HIGH) {
-          dc.onbufferedamountlow = () => {
-            dc.onbufferedamountlow = null;
-            sendSlice();
-          };
-          return;
-        }
-
-        // Slice ONLY this chunk from disk blob, load only 256KB into memory!
-        const chunkBlob = file.slice(offset, offset + CHUNK_SIZE);
-        const chunkBuffer = await chunkBlob.arrayBuffer();
-
-        if (isAborted || currentTransferAborted) {
-          resolve();
-          return;
-        }
-
-        try {
-          dc.send(chunkBuffer);
-        } catch (err) {
-          console.error('[DataChannel] Erro ao enviar chunk:', err);
-          resolve();
-          return;
-        }
-
-        offset += chunkBuffer.byteLength;
-        updateTransferProgress(offset, totalBytes);
-      }
-
-      // Finish sending
+      // All blocks sent
       try {
         dc.send(JSON.stringify({
           type: 'FILE_COMPLETE',
@@ -1637,7 +1669,7 @@ async function sendFileOverDataChannel(dc, file, sha256) {
   });
 }
 
-// Fallback Relay File Sending (Streaming Chunk Slices)
+// Fallback Relay File Sending (Pipeline Read-Ahead, 2 MB blocks)
 async function sendFileOverRelay(targetPeerId, file, sha256) {
   sendPeerAppMessage(targetPeerId, {
     type: 'FILE_META',
@@ -1649,29 +1681,44 @@ async function sendFileOverRelay(targetPeerId, file, sha256) {
   });
 
   const totalBytes = file.size;
-  let offset = 0;
   const relayChunkSize = 64 * 1024; // 64 KB for MQTT payload safety
+  const relayBlockSize = 2 * 1024 * 1024; // 2 MB read-ahead blocks for relay
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
   currentTransferAborted = false;
 
-  while (offset < totalBytes) {
+  let fileOffset = 0;
+  let totalSent = 0;
+
+  while (fileOffset < totalBytes) {
     if (currentTransferAborted) break;
 
-    const chunkBlob = file.slice(offset, offset + relayChunkSize);
-    const chunkBuffer = await chunkBlob.arrayBuffer();
+    // Read a 2 MB block from disk
+    const blockEnd = Math.min(fileOffset + relayBlockSize, totalBytes);
+    const block = await file.slice(fileOffset, blockEnd).arrayBuffer();
+    fileOffset = blockEnd;
 
     if (currentTransferAborted) break;
 
-    sendPeerAppMessage(targetPeerId, {
-      type: 'FILE_CHUNK_RELAY',
-      chunk: Array.from(new Uint8Array(chunkBuffer))
-    });
+    // Slice the block into 64 KB relay chunks (synchronous = fast)
+    let blockOffset = 0;
+    while (blockOffset < block.byteLength) {
+      if (currentTransferAborted) break;
 
-    offset += chunkBuffer.byteLength;
-    updateTransferProgress(offset, totalBytes);
-    await new Promise(r => setTimeout(r, 15));
+      const end = Math.min(blockOffset + relayChunkSize, block.byteLength);
+      const chunk = block.slice(blockOffset, end);
+
+      sendPeerAppMessage(targetPeerId, {
+        type: 'FILE_CHUNK_RELAY',
+        chunk: Array.from(new Uint8Array(chunk))
+      });
+
+      blockOffset += chunk.byteLength;
+      totalSent += chunk.byteLength;
+      updateTransferProgress(totalSent, totalBytes);
+      await new Promise(r => setTimeout(r, 10));
+    }
   }
 
   if (!currentTransferAborted) {
