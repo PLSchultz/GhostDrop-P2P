@@ -22,10 +22,9 @@ const MQTT_BROKERS = [
 ];
 let currentBrokerIndex = 0;
 
-const CHUNK_SIZE = 64 * 1024;          // 64 KB per chunk (safest SCTP packet size across all browsers)
-const READ_AHEAD_SIZE = 8 * 1024 * 1024; // 8 MB sequential disk read block (pipelined)
-const BUFFER_HIGH = 16 * 1024 * 1024;   // 16 MB: keeps the network pipe 100% saturated
-const BUFFER_LOW = 4 * 1024 * 1024;     // 4 MB: resume sending threshold
+const CHUNK_SIZE = 32 * 1024;          // 32 KB per chunk (universal SCTP compatibility)
+const BUFFER_HIGH = 512 * 1024;        // 512 KB high-water buffer
+const BUFFER_LOW = 128 * 1024;         // 128 KB low-water resume threshold
 
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
@@ -1392,10 +1391,14 @@ function removePeer(peerId) {
           });
         }
 
-// Streaming Transfer over WebRTC DataChannel (Double-Buffer Pipeline)
+// Streaming Transfer over WebRTC DataChannel (Rock-solid async stream with active drain timer)
 async function sendFileOverDataChannel(dc, file, sha256) {
+  const CHUNK_SIZE = 32 * 1024;       // 32 KB: maximum compatibility and zero packet drop
+  const MAX_BUFFER = 512 * 1024;      // 512 KB: safe high-water mark for SCTP
+  const RESUME_BUFFER = 128 * 1024;   // 128 KB: low-water mark to resume sending
+
   try {
-    dc.bufferedAmountLowThreshold = BUFFER_LOW;
+    dc.bufferedAmountLowThreshold = RESUME_BUFFER;
   } catch (e) { }
 
   dc.send(JSON.stringify({
@@ -1408,124 +1411,105 @@ async function sendFileOverDataChannel(dc, file, sha256) {
   }));
 
   const totalBytes = file.size;
+  let totalSent = 0;
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
   currentTransferAborted = false;
 
-  // Read a block from the File blob on disk
-  function readBlock(startOffset) {
-    if (startOffset >= totalBytes) return Promise.resolve(null);
-    const end = Math.min(startOffset + READ_AHEAD_SIZE, totalBytes);
-    return file.slice(startOffset, end).arrayBuffer();
-  }
+  let isAborted = false;
+  currentSendAbort = () => {
+    isAborted = true;
+  };
 
-  // Pre-read first block
-  let currentBlock = await readBlock(0);
-  if (!currentBlock) {
-    dc.send(JSON.stringify({ type: 'FILE_COMPLETE', sha256 }));
-    onSendComplete(sha256);
-    return;
-  }
-
-  let fileOffset = Math.min(READ_AHEAD_SIZE, totalBytes);
-  // Start pre-reading the second block in parallel (pipelining)
-  let nextBlockPromise = readBlock(fileOffset);
-
-  let blockOffset = 0;
-  let totalSent = 0;
-
-  return new Promise((resolve) => {
-    let isAborted = false;
-
-    currentSendAbort = () => {
-      isAborted = true;
-      resolve();
-    };
-
-    async function sendSlice() {
-      while (currentBlock) {
-        while (blockOffset < currentBlock.byteLength) {
-          if (isAborted || currentTransferAborted) {
-            resolve();
-            return;
-          }
-
-          // SCTP backpressure: wait for socket buffer to drain below BUFFER_HIGH
-          if (dc.bufferedAmount > BUFFER_HIGH) {
-            dc.onbufferedamountlow = () => {
-              dc.onbufferedamountlow = null;
-              sendSlice();
-            };
-            return;
-          }
-
-          const remaining = currentBlock.byteLength - blockOffset;
-          const chunkLen = Math.min(CHUNK_SIZE, remaining);
-          const chunk = currentBlock.slice(blockOffset, blockOffset + chunkLen);
-
-          try {
-            dc.send(chunk);
-          } catch (err) {
-            console.error('[DataChannel] Erro ao enviar chunk:', err);
-            resolve();
-            return;
-          }
-
-          blockOffset += chunkLen;
-          totalSent += chunkLen;
-          updateTransferProgress(totalSent, totalBytes);
-        }
-
-        // Current block fully sent — swap in the pre-read next block
-        if (totalSent >= totalBytes) break;
-
-        currentBlock = await nextBlockPromise;
-        blockOffset = 0;
-        fileOffset += READ_AHEAD_SIZE;
-        nextBlockPromise = readBlock(fileOffset);
-      }
-
-      if (isAborted || currentTransferAborted) {
-        resolve();
-        return;
-      }
-
-      // Wait for outgoing buffer to drain before sending completion
-      // This ensures receiver gets all chunks before receiving FILE_COMPLETE
-      async function waitForDrain() {
-        while (dc.bufferedAmount > 0) {
-          if (isAborted || currentTransferAborted) return;
-          await new Promise(r => {
-            dc.onbufferedamountlow = () => {
-              dc.onbufferedamountlow = null;
-              r();
-            };
-            setTimeout(r, 40);
-          });
+  // Helper: wait until bufferedAmount is below threshold, using BOTH event and active timer
+  // (Prevents freezing if the browser misses bufferedamountlow or if threshold is bypassed)
+  async function waitDrain(threshold = RESUME_BUFFER) {
+    if (dc.bufferedAmount <= threshold) return;
+    await new Promise(resolve => {
+      let resolved = false;
+      function done() {
+        if (!resolved) {
+          resolved = true;
+          try { dc.removeEventListener('bufferedamountlow', done); } catch (e) { }
+          resolve();
         }
       }
+      try { dc.addEventListener('bufferedamountlow', done); } catch (e) { }
+      const timer = setInterval(() => {
+        if (dc.bufferedAmount <= threshold || resolved || isAborted || currentTransferAborted) {
+          clearInterval(timer);
+          done();
+        }
+      }, 15);
+    });
+  }
 
-      await waitForDrain();
+  // Read from disk in 4 MB blocks (low RAM, fast sequential read)
+  const BLOCK_SIZE = 4 * 1024 * 1024;
+  let offset = 0;
 
-      if (isAborted || currentTransferAborted) {
-        resolve();
-        return;
+  while (offset < totalBytes) {
+    if (isAborted || currentTransferAborted) return;
+
+    const blockEnd = Math.min(offset + BLOCK_SIZE, totalBytes);
+    const blockBlob = file.slice(offset, blockEnd);
+    const blockBuffer = await blockBlob.arrayBuffer();
+
+    if (isAborted || currentTransferAborted) return;
+
+    let blockOffset = 0;
+    while (blockOffset < blockBuffer.byteLength) {
+      if (isAborted || currentTransferAborted) return;
+
+      // Throttle if WebRTC send buffer is full
+      if (dc.bufferedAmount > MAX_BUFFER) {
+        await waitDrain(RESUME_BUFFER);
       }
+
+      if (isAborted || currentTransferAborted) return;
+
+      const chunkLen = Math.min(CHUNK_SIZE, blockBuffer.byteLength - blockOffset);
+      const chunk = blockBuffer.slice(blockOffset, blockOffset + chunkLen);
 
       try {
-        dc.send(JSON.stringify({
-          type: 'FILE_COMPLETE',
-          sha256: sha256
-        }));
-      } catch (e) { }
+        dc.send(chunk);
+      } catch (err) {
+        // If browser buffer threw an error, wait for drain and retry once
+        console.warn('[DataChannel] Buffer cheio ao enviar chunk, aguardando...', err);
+        await waitDrain(RESUME_BUFFER);
+        await new Promise(r => setTimeout(r, 20));
+        try {
+          dc.send(chunk);
+        } catch (retryErr) {
+          console.error('[DataChannel] Erro crítico ao enviar chunk:', retryErr);
+          return;
+        }
+      }
 
-      onSendComplete(sha256);
-      resolve();
+      blockOffset += chunkLen;
+      totalSent += chunkLen;
+      updateTransferProgress(totalSent, totalBytes);
     }
 
-    sendSlice();
-  });
+    offset = blockEnd;
+  }
+
+  if (isAborted || currentTransferAborted) return;
+
+  // Wait until ALL remaining bytes in the socket are delivered
+  await waitDrain(0);
+
+  if (isAborted || currentTransferAborted) return;
+
+  try {
+    dc.send(JSON.stringify({
+      type: 'FILE_COMPLETE',
+      sha256: sha256
+    }));
+  } catch (e) { }
+
+  onSendComplete(sha256);
 }
 
           // Fallback Relay File Sending (base64 encoded, read-ahead blocks)
