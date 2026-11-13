@@ -177,6 +177,34 @@ const incomingModalSenderName = document.getElementById('incomingModalSenderName
 const btnModalAccept = document.getElementById('btnModalAccept');
 const btnModalReject = document.getElementById('btnModalReject');
 
+// Mobile Room Switcher Elements
+const mobileRoomSwitcher = document.getElementById('mobileRoomSwitcher');
+const btnSwitchChat = document.getElementById('btnSwitchChat');
+const btnSwitchFiles = document.getElementById('btnSwitchFiles');
+const chatPanel = document.getElementById('chatPanel');
+const filesPanel = document.getElementById('filesPanel');
+const chatUnreadDot = document.getElementById('chatUnreadDot');
+const filesUnreadDot = document.getElementById('filesUnreadDot');
+let activeMobilePanel = 'chat';
+
+function switchMobilePanel(panel) {
+  activeMobilePanel = panel;
+  if (!btnSwitchChat || !btnSwitchFiles || !chatPanel || !filesPanel) return;
+  if (panel === 'chat') {
+    btnSwitchChat.classList.add('active');
+    btnSwitchFiles.classList.remove('active');
+    chatPanel.classList.add('mobile-active');
+    filesPanel.classList.remove('mobile-active');
+    if (chatUnreadDot) chatUnreadDot.classList.add('hidden');
+  } else {
+    btnSwitchFiles.classList.add('active');
+    btnSwitchChat.classList.remove('active');
+    filesPanel.classList.add('mobile-active');
+    chatPanel.classList.remove('mobile-active');
+    if (filesUnreadDot) filesUnreadDot.classList.add('hidden');
+  }
+}
+
 // Initialize Application
 document.addEventListener('DOMContentLoaded', () => {
   initNickname();
@@ -405,6 +433,14 @@ function setupEventListeners() {
   });
 
   btnEnterRoom.addEventListener('click', enterSelectedRoom);
+
+  // Mobile room panel tabs
+  if (btnSwitchChat) {
+    btnSwitchChat.addEventListener('click', () => switchMobilePanel('chat'));
+  }
+  if (btnSwitchFiles) {
+    btnSwitchFiles.addEventListener('click', () => switchMobilePanel('files'));
+  }
 
   // In-Room Copy Code
   btnRoomCopyCode.addEventListener('click', () => {
@@ -1301,6 +1337,7 @@ function enterRoomUI(code) {
 
   renderParticipantsList();
   updateVideoGridCount();
+  switchMobilePanel('chat');
 }
 
 // UI Transition: Leave Room
@@ -1311,6 +1348,7 @@ function leaveRoom() {
   inRoom = false;
   clearInterval(heartbeatTimer);
   resetAllConnections();
+  switchMobilePanel('chat');
   activeRoomSection.classList.add('hidden');
   pairingSection.classList.remove('hidden');
   connectStatusBanner.classList.add('hidden');
@@ -1421,6 +1459,10 @@ function appendChatMessage(text, direction, timeStr = formatTime(), sender = myN
   bubble.appendChild(timeEl);
   chatMessages.appendChild(bubble);
   chatMessages.scrollTop = chatMessages.scrollHeight;
+
+  if (direction === 'received' && window.innerWidth <= 768 && activeMobilePanel !== 'chat' && chatUnreadDot) {
+    chatUnreadDot.classList.remove('hidden');
+  }
 }
 
 function appendSystemMessage(htmlText) {
@@ -1614,6 +1656,9 @@ async function startSendingNextQueuedFile(targetPeerId) {
 function addTransferToHistory(transfer) {
   sessionTransfers.unshift(transfer);
   renderTransfersList();
+  if (window.innerWidth <= 768 && activeMobilePanel !== 'files' && filesUnreadDot) {
+    filesUnreadDot.classList.remove('hidden');
+  }
 }
 
 function renderTransfersList() {
