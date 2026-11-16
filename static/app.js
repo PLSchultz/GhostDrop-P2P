@@ -2,7 +2,7 @@
  * GhostDrop - Direct & Secure File Sharing and Real-time Chat
  */
 
-// WebRTC STUN & TURN Configuration
+// WebRTC STUN Configuration (Servidores rápidos de resposta imediata)
 const STUN_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -11,23 +11,7 @@ const STUN_SERVERS = {
     { urls: 'stun:stun3.l.google.com:19302' },
     { urls: 'stun:stun4.l.google.com:19302' },
     { urls: 'stun:stun.cloudflare.com:3478' },
-    { urls: 'stun:stun.sipgate.net:3478' },
-    { urls: 'stun:openrelay.metered.ca:80' },
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    }
+    { urls: 'stun:stun.sipgate.net:3478' }
   ],
   iceCandidatePoolSize: 10
 };
@@ -39,8 +23,8 @@ const MQTT_BROKERS = [
 let currentBrokerIndex = 0;
 
 const CHUNK_SIZE = 64 * 1024;          // 64 KB por chunk (máxima interoperabilidade WebRTC)
-const BUFFER_HIGH = 8 * 1024 * 1024;   // 8 MB: buffer máximo antes de pausar
-const BUFFER_LOW = 2 * 1024 * 1024;    // 2 MB: retomar envio abaixo disso
+const BUFFER_HIGH = 16 * 1024 * 1024;  // 16 MB: saturação total de banda para máxima velocidade
+const BUFFER_LOW = 4 * 1024 * 1024;    // 4 MB: retoma sem engasgar o pipeline
 
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
@@ -822,9 +806,10 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
     dc: dc,
     nickname: targetNickname,
     isPolite: isPolite,
+    makingOffer: false,
+    ignoreOffer: false,
     state: 'connecting',
     mode: 'p2p',
-    hasAnswer: false,
     relayFallbackTimer: null,
     retryTimer: null
   };
@@ -832,6 +817,10 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
   renderParticipantsList();
 
   function markConnected(mode = 'p2p') {
+    // Se o DataChannel estiver aberto, a conexão é garantidamente P2P
+    if (peerObj.dc && peerObj.dc.readyState === 'open') {
+      mode = 'p2p';
+    }
     const stateChanged = peerObj.state !== 'connected' || peerObj.mode !== mode;
     peerObj.state = 'connected';
     peerObj.mode = mode;
@@ -848,13 +837,13 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
     }
   }
 
-  // Fallback timer: if direct P2P takes more than 10s, activate relay mode seamlessly
+  // Fallback timer: só aciona o relay de contingência se o canal P2P não abrir em 12 segundos
   peerObj.relayFallbackTimer = setTimeout(() => {
-    if (peerObj.state !== 'connected') {
+    if (peerObj.state !== 'connected' && (!peerObj.dc || peerObj.dc.readyState !== 'open')) {
       markConnected('relay');
-      appendSystemMessage(`🛡️ Conexão estabelecida com <strong>${escapeHtml(peerObj.nickname)}</strong>.`);
+      appendSystemMessage(`🛡️ Conexão de contingência estabelecida com <strong>${escapeHtml(peerObj.nickname)}</strong>.`);
     }
-  }, 10000);
+  }, 12000);
 
   setupDataChannelListeners(targetPeerId, dc, markConnected);
 
@@ -871,7 +860,7 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
         type: 'ICE',
         targetPeerId: targetPeerId,
         fromPeerId: myPeerId,
-        candidate: {
+        candidate: event.candidate.toJSON ? event.candidate.toJSON() : {
           candidate: event.candidate.candidate,
           sdpMid: event.candidate.sdpMid,
           sdpMLineIndex: event.candidate.sdpMLineIndex
@@ -881,10 +870,28 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
   };
 
   pc.onconnectionstatechange = () => {
+    console.log(`[WebRTC] ${targetPeerId} connectionState:`, pc.connectionState);
     if (pc.connectionState === 'connected') {
       markConnected('p2p');
     } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-      markConnected('relay');
+      if (peerObj.dc && peerObj.dc.readyState === 'open') {
+        markConnected('p2p');
+      } else {
+        markConnected('relay');
+      }
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    console.log(`[WebRTC] ${targetPeerId} iceConnectionState:`, pc.iceConnectionState);
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      markConnected('p2p');
+    } else if (pc.iceConnectionState === 'failed') {
+      if (peerObj.dc && peerObj.dc.readyState === 'open') {
+        markConnected('p2p');
+      } else {
+        markConnected('relay');
+      }
     }
   };
 
@@ -893,8 +900,10 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
 
 async function initiateOffer(targetPeerId) {
   const peer = connectedPeers.get(targetPeerId);
-  if (!peer) return;
+  if (!peer || peer.makingOffer) return;
   try {
+    peer.makingOffer = true;
+    if (peer.pc.signalingState !== 'stable') return;
     const offer = await peer.pc.createOffer();
     await peer.pc.setLocalDescription(offer);
     sendSignalingMessage(currentSignalingTopic, {
@@ -906,6 +915,8 @@ async function initiateOffer(targetPeerId) {
     });
   } catch (err) {
     console.warn(`[WebRTC] Erro ao criar oferta para ${targetPeerId}:`, err);
+  } finally {
+    peer.makingOffer = false;
   }
 }
 
@@ -915,15 +926,22 @@ async function handleOffer(targetPeerId, offerSdp) {
 
   try {
     const pc = peer.pc;
-    const isCollision = (pc.signalingState !== 'stable') || peer.hasAnswer;
+    const isCollision = (pc.signalingState !== 'stable') || peer.makingOffer;
 
-    if (isCollision && !peer.isPolite) {
+    peer.ignoreOffer = !peer.isPolite && isCollision;
+    if (peer.ignoreOffer) {
+      console.log(`[WebRTC] Colisão detectada com ${targetPeerId}. Sou impolite, ignorando oferta remota.`);
       return;
+    }
+
+    if (isCollision && peer.isPolite) {
+      console.log(`[WebRTC] Colisão detectada com ${targetPeerId}. Sou polite, aplicando rollback.`);
+      await pc.setLocalDescription({ type: 'rollback' }).catch(() => {});
     }
 
     await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
 
-    // Process any queued ICE candidates
+    // Process queued ICE candidates
     if (pendingIceCandidates.has(targetPeerId)) {
       const candidates = pendingIceCandidates.get(targetPeerId);
       for (const c of candidates) {
@@ -934,7 +952,6 @@ async function handleOffer(targetPeerId, offerSdp) {
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-    peer.hasAnswer = true;
 
     sendSignalingMessage(currentSignalingTopic, {
       type: 'ANSWER',
@@ -955,9 +972,8 @@ async function handleAnswer(targetPeerId, answerSdp) {
     const pc = peer.pc;
     if (pc.signalingState === 'have-local-offer') {
       await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
-      peer.hasAnswer = true;
 
-      // Process any queued ICE candidates
+      // Process queued ICE candidates
       if (pendingIceCandidates.has(targetPeerId)) {
         const candidates = pendingIceCandidates.get(targetPeerId);
         for (const c of candidates) {
@@ -973,7 +989,7 @@ async function handleAnswer(targetPeerId, answerSdp) {
 
 async function handleIceCandidate(targetPeerId, candidateObj) {
   const peer = connectedPeers.get(targetPeerId);
-  if (!peer || !peer.pc.remoteDescription || !peer.pc.remoteDescription.type) {
+  if (!peer || !peer.pc || !peer.pc.remoteDescription || !peer.pc.remoteDescription.type) {
     if (!pendingIceCandidates.has(targetPeerId)) {
       pendingIceCandidates.set(targetPeerId, []);
     }
@@ -988,7 +1004,17 @@ async function handleIceCandidate(targetPeerId, candidateObj) {
 // Data Channel Handlers
 function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
   channel.onopen = () => {
+    console.log(`[DataChannel] Canal de dados aberto com ${targetPeerId}! Modo P2P ativo.`);
     const peer = connectedPeers.get(targetPeerId);
+    if (peer) {
+      peer.state = 'connected';
+      peer.mode = 'p2p';
+      if (peer.relayFallbackTimer) {
+        clearTimeout(peer.relayFallbackTimer);
+        peer.relayFallbackTimer = null;
+      }
+      renderParticipantsList();
+    }
     if (onConnectedCallback) onConnectedCallback('p2p');
 
     try {
@@ -1000,7 +1026,7 @@ function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
     } catch (e) { }
 
     const peerNick = peer ? peer.nickname : 'Participante';
-    appendSystemMessage(`⚡ <strong>${escapeHtml(peerNick)}</strong> conectou-se à sala.`);
+    appendSystemMessage(`⚡ <strong>${escapeHtml(peerNick)}</strong> conectado via P2P direto (alta velocidade).`);
   };
 
   channel.onclose = () => {
@@ -1298,14 +1324,22 @@ function renderParticipantsList() {
 
   // 2. Add Connected/Connecting Peers
   connectedPeers.forEach((peer) => {
-    const isConn = peer.state === 'connected';
-    const statusText = isConn ? '' : `<small style="opacity:0.65; font-size:0.75rem; margin-left:4px; color:#fb7185;">(conectando...)</small>`;
+    const isDirect = peer.dc && peer.dc.readyState === 'open';
+    const isConn = peer.state === 'connected' || isDirect;
+    let badgeHtml = '';
+    if (isDirect) {
+      badgeHtml = `<span style="font-size:0.75rem; margin-left:6px; color:#10b981; font-weight:700;">⚡ P2P Direto</span>`;
+    } else if (isConn) {
+      badgeHtml = `<span style="font-size:0.75rem; margin-left:6px; color:#f59e0b; font-weight:600;">🛡️ Relay</span>`;
+    } else {
+      badgeHtml = `<small style="opacity:0.65; font-size:0.75rem; margin-left:4px; color:#fb7185;">(conectando...)</small>`;
+    }
 
     const chip = document.createElement('div');
     chip.className = 'peer-chip';
     chip.innerHTML = `
       <span class="peer-chip-avatar" style="background:${getNicknameColor(peer.nickname)};"></span>
-      <span>${escapeHtml(peer.nickname)} ${statusText}</span>
+      <span>${escapeHtml(peer.nickname)} ${badgeHtml}</span>
     `;
     participantsChips.appendChild(chip);
   });
@@ -1446,9 +1480,11 @@ async function startSendingNextQueuedFile(targetPeerId) {
 
   openTransferModal(file.name, file.size, 'Enviando Arquivo...');
 
-  if (targetPeer.mode === 'p2p' && targetPeer.dc && targetPeer.dc.readyState === 'open') {
+  if (targetPeer.dc && targetPeer.dc.readyState === 'open') {
+    targetPeer.mode = 'p2p';
     await sendFileOverDataChannel(targetPeer.dc, targetPeerId, file, arrayBuffer, sha256);
   } else {
+    targetPeer.mode = 'relay';
     await sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256);
   }
 
@@ -1602,8 +1638,8 @@ async function sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256) {
 
   const totalBytes = arrayBuffer.byteLength;
   let offset = 0;
-  // 16 KB chunks -> Base64 string ~21KB -> seguro para brokers MQTT públicos
-  const relayChunkSize = 16 * 1024;
+  // 32 KB chunks -> Base64 string ~43KB -> seguro e muito mais veloz para MQTT
+  const relayChunkSize = 32 * 1024;
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
@@ -1612,7 +1648,7 @@ async function sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256) {
     if (currentTransferAborted) return;
 
     if (!mqttClient || !mqttClient.connected) {
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 400));
       continue;
     }
 
@@ -1627,7 +1663,7 @@ async function sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256) {
 
     offset += chunk.byteLength;
     updateTransferProgress(offset, totalBytes);
-    await new Promise(r => setTimeout(r, 25));
+    await new Promise(r => setTimeout(r, 8));
   }
 
   if (currentTransferAborted) return;
