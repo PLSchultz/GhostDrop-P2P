@@ -22,8 +22,8 @@ const MQTT_BROKERS = [
 ];
 let currentBrokerIndex = 0;
 
-const CHUNK_SIZE = 512 * 1024;        // 512 KB por chunk (máximo throughput WebRTC)
-const BUFFER_HIGH = 16 * 1024 * 1024;  // 16 MB buffer limite
+const CHUNK_SIZE = 64 * 1024;         // 64 KB por chunk (limite universal de interoperabilidade WebRTC)
+const BUFFER_HIGH = 16 * 1024 * 1024;  // 16 MB buffer limite (pipeline ultra-rápido)
 const BUFFER_LOW = 4 * 1024 * 1024;    // 4 MB buffer de retoma
 
 // Local Identity State
@@ -1091,7 +1091,7 @@ function onDataMessage(fromPeerId, msg) {
   // 10. File Transfer Completed
   else if (msg.type === 'FILE_COMPLETE') {
     if (currentReceivingMeta && msg.totalBytes && receivedBytes < msg.totalBytes) {
-      console.log(`[Transfer] FILE_COMPLETE recebido mas aguardando ${msg.totalBytes - receivedBytes} bytes restantes...`);
+      console.log(`[Transfer] FILE_COMPLETE recebido: ${receivedBytes} de ${msg.totalBytes} bytes. Aguardando pacotes restantes...`);
       pendingCompletionMsg = msg;
     } else {
       finishReceivedFile(msg);
@@ -1099,6 +1099,7 @@ function onDataMessage(fromPeerId, msg) {
   }
   // 10.1 File Transfer Complete Acknowledged by Receiver
   else if (msg.type === 'FILE_COMPLETE_ACK') {
+    console.log('[Transfer] Handshake concluído com sucesso: Destinatário confirmou recepção e download!');
     if (typeof currentSendResolve === 'function') {
       currentSendResolve();
       currentSendResolve = null;
@@ -1453,7 +1454,8 @@ function removePeer(peerId) {
 
 // Streaming Transfer over WebRTC DataChannel (Rock-solid async stream with active drain timer)
 async function sendFileOverDataChannel(dc, targetPeerId, file, sha256) {
-  const CHUNK_SIZE = 512 * 1024;       // 512 KB por chunk: throughput ultra-rápido
+  // Use optimal chunk size according to SCTP maxMessageSize or safe 64KB (256KB max on Chrome/Edge)
+  const CHUNK_SIZE = 64 * 1024;        // 64 KB: safe for all Chromium/Firefox/Safari SCTP stacks
   const MAX_BUFFER = 16 * 1024 * 1024; // 16 MB: buffer amplo para saturação de banda
   const RESUME_BUFFER = 4 * 1024 * 1024; // 4 MB: retoma sem engasgar o pipeline
 
@@ -1502,7 +1504,7 @@ async function sendFileOverDataChannel(dc, targetPeerId, file, sha256) {
           clearInterval(timer);
           done();
         }
-      }, 15);
+      }, 10);
     });
   }
 
@@ -1536,15 +1538,24 @@ async function sendFileOverDataChannel(dc, targetPeerId, file, sha256) {
       try {
         dc.send(chunk);
       } catch (err) {
-        // If browser buffer threw an error, wait for drain and retry once
-        console.warn('[DataChannel] Buffer cheio ao enviar chunk, aguardando...', err);
+        // If browser buffer threw an error, wait for drain and retry
+        console.warn('[DataChannel] Buffer cheio ao enviar chunk, aguardando drenagem...', err);
         await waitDrain(RESUME_BUFFER);
         await new Promise(r => setTimeout(r, 20));
         try {
           dc.send(chunk);
         } catch (retryErr) {
-          console.error('[DataChannel] Erro crítico ao enviar chunk:', retryErr);
-          return;
+          console.error('[DataChannel] Erro ao reenviar chunk:', retryErr);
+          // Wait longer and try one more time before failing
+          await waitDrain(0);
+          await new Promise(r => setTimeout(r, 50));
+          try {
+            dc.send(chunk);
+          } catch (fatalErr) {
+            console.error('[DataChannel] Falha crítica no canal de dados:', fatalErr);
+            alert('Erro de conexão durante a transferência do arquivo.');
+            return;
+          }
         }
       }
 
@@ -1566,23 +1577,42 @@ async function sendFileOverDataChannel(dc, targetPeerId, file, sha256) {
 
   if (isAborted || currentTransferAborted) return;
 
+  console.log(`[Transfer] Todos os ${totalBytes} bytes transmitidos pelo socket. Enviando FILE_COMPLETE e aguardando confirmação do destinatário...`);
+
+  const compPayload = {
+    type: 'FILE_COMPLETE',
+    totalBytes: totalBytes,
+    sha256: sha256
+  };
+
   try {
-    dc.send(JSON.stringify({
-      type: 'FILE_COMPLETE',
-      totalBytes: totalBytes,
-      sha256: sha256
-    }));
+    dc.send(JSON.stringify(compPayload));
   } catch (e) { }
 
-  // Wait for the receiver to confirm full receipt and download (with 6s fallback safety)
+  // Também envia via mensagem de app / sinalização como redundância garantida
+  sendPeerAppMessage(targetPeerId, compPayload);
+
+  // Aguarda confirmação de recepção do destinatário (com re-transmissão periódica se demorar)
   await new Promise(resolve => {
     currentSendResolve = resolve;
-    setTimeout(() => {
-      if (currentSendResolve === resolve) {
-        currentSendResolve = null;
-        resolve();
+    let attempts = 0;
+    const ackInterval = setInterval(() => {
+      attempts++;
+      if (currentSendResolve === null || isAborted || currentTransferAborted) {
+        clearInterval(ackInterval);
+        return;
       }
-    }, 6000);
+      if (attempts >= 60) { // 30 segundos de tolerância total
+        clearInterval(ackInterval);
+        if (typeof currentSendResolve === 'function') {
+          currentSendResolve();
+          currentSendResolve = null;
+        }
+        return;
+      }
+      // Reenvia sinal de conclusão caso o destinatário ainda esteja finalizando pacotes
+      try { dc.send(JSON.stringify(compPayload)); } catch (e) { }
+    }, 500);
   });
 
   onSendComplete(sha256);
