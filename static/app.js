@@ -22,9 +22,9 @@ const MQTT_BROKERS = [
 ];
 let currentBrokerIndex = 0;
 
-const CHUNK_SIZE = 32 * 1024;          // 32 KB per chunk (universal SCTP compatibility)
-const BUFFER_HIGH = 512 * 1024;        // 512 KB high-water buffer
-const BUFFER_LOW = 128 * 1024;         // 128 KB low-water resume threshold
+const CHUNK_SIZE = 512 * 1024;        // 512 KB por chunk (máximo throughput WebRTC)
+const BUFFER_HIGH = 16 * 1024 * 1024;  // 16 MB buffer limite
+const BUFFER_LOW = 4 * 1024 * 1024;    // 4 MB buffer de retoma
 
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
@@ -59,10 +59,12 @@ let receivedBytes = 0;
 let transferStartTime = 0;
 let lastBytes = 0;
 let lastTime = 0;
+let pendingCompletionMsg = null;
 
 // Transfer control
 let currentTransferAborted = false;
 let currentSendAbort = null;
+let currentSendResolve = null;
 
 // Typing indicator state
 const typingPeers = new Map(); // peerId -> { timeout, nickname }
@@ -496,6 +498,7 @@ function setupEventListeners() {
       pendingIncomingOffer = null;
       receivedChunks = [];
       receivedBytes = 0;
+      pendingCompletionMsg = null;
       currentTransferAborted = false;
 
       sendPeerAppMessage(offer.senderPeerId, {
@@ -826,7 +829,9 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
           try {
             remoteDc.bufferedAmountLowThreshold = BUFFER_LOW;
           } catch (e) { }
-          peerObj.dc = remoteDc;
+          if (!peerObj.dc || peerObj.dc.readyState !== 'open') {
+            peerObj.dc = remoteDc;
+          }
           setupDataChannelListeners(targetPeerId, remoteDc, markConnected);
         };
 
@@ -952,60 +957,71 @@ async function handleIceCandidate(targetPeerId, candidateObj) {
 
 // Data Channel Handlers
 function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
-        channel.onopen = () => {
-          const peer = connectedPeers.get(targetPeerId);
-          if (onConnectedCallback) onConnectedCallback('p2p');
+  channel.binaryType = 'arraybuffer';
+  try {
+    channel.bufferedAmountLowThreshold = BUFFER_LOW;
+  } catch (e) { }
 
-          try {
-            channel.send(JSON.stringify({
-              type: 'PEER_INFO',
-              peerId: myPeerId,
-              nickname: myNickname
-            }));
-          } catch (e) { }
+  channel.onopen = () => {
+    const peer = connectedPeers.get(targetPeerId);
+    if (onConnectedCallback) onConnectedCallback('p2p');
 
-          const peerNick = peer ? peer.nickname : 'Participante';
-          appendSystemMessage(`⚡ <strong>${escapeHtml(peerNick)}</strong> conectou-se à sala.`);
-        };
+    try {
+      channel.send(JSON.stringify({
+        type: 'PEER_INFO',
+        peerId: myPeerId,
+        nickname: myNickname
+      }));
+    } catch (e) { }
 
-        channel.onclose = () => {
-          const peer = connectedPeers.get(targetPeerId);
-          if (peer && peer.state === 'connected') {
-            peer.mode = 'relay';
-            renderParticipantsList();
-          } else {
-            removePeer(targetPeerId);
-          }
-        };
+    const peerNick = peer ? peer.nickname : 'Participante';
+    appendSystemMessage(`⚡ <strong>${escapeHtml(peerNick)}</strong> conectou-se à sala.`);
+  };
 
-        channel.onerror = () => {
-          const peer = connectedPeers.get(targetPeerId);
-          if (peer) {
-            peer.mode = 'relay';
-            renderParticipantsList();
-          }
-        };
+  channel.onclose = () => {
+    const peer = connectedPeers.get(targetPeerId);
+    if (peer && peer.state === 'connected') {
+      peer.mode = 'relay';
+      renderParticipantsList();
+    } else {
+      removePeer(targetPeerId);
+    }
+  };
 
-        channel.onmessage = (event) => {
-          // 1. Binary chunk received — push directly to array (simple & fast)
-          if (event.data instanceof ArrayBuffer) {
-            receivedChunks.push(event.data);
-            receivedBytes += event.data.byteLength;
-            if (currentReceivingMeta) {
-              updateTransferProgress(receivedBytes, currentReceivingMeta.size);
-            }
-            return;
-          }
+  channel.onerror = () => {
+    const peer = connectedPeers.get(targetPeerId);
+    if (peer) {
+      peer.mode = 'relay';
+      renderParticipantsList();
+    }
+  };
 
-          // 2. Text/JSON message
-          try {
-            const msg = JSON.parse(event.data);
-            onDataMessage(targetPeerId, msg);
-          } catch (e) {
-            console.warn('[DataChannel] Erro ao decodificar JSON:', e);
-          }
-        };
+  channel.onmessage = (event) => {
+    // 1. Binary chunk received — push directly to array
+    if (event.data instanceof ArrayBuffer) {
+      receivedChunks.push(event.data);
+      receivedBytes += event.data.byteLength;
+      if (currentReceivingMeta) {
+        updateTransferProgress(receivedBytes, currentReceivingMeta.size);
       }
+      // If FILE_COMPLETE arrived earlier than final in-flight chunks, trigger completion once all bytes are in
+      if (pendingCompletionMsg && receivedBytes >= pendingCompletionMsg.totalBytes) {
+        const comp = pendingCompletionMsg;
+        pendingCompletionMsg = null;
+        finishReceivedFile(comp);
+      }
+      return;
+    }
+
+    // 2. Text/JSON message
+    try {
+      const msg = JSON.parse(event.data);
+      onDataMessage(targetPeerId, msg);
+    } catch (e) {
+      console.warn('[DataChannel] Erro ao decodificar JSON:', e);
+    }
+  };
+}
 
 // Handle In-App Protocol Messages (Chat, File Transfer)
 function onDataMessage(fromPeerId, msg) {
@@ -1062,6 +1078,7 @@ function onDataMessage(fromPeerId, msg) {
     currentReceivingMeta = msg;
     receivedChunks = [];
     receivedBytes = 0;
+    pendingCompletionMsg = null;
     transferStartTime = Date.now();
     lastBytes = 0;
     lastTime = Date.now();
@@ -1073,7 +1090,19 @@ function onDataMessage(fromPeerId, msg) {
   }
   // 10. File Transfer Completed
   else if (msg.type === 'FILE_COMPLETE') {
-    finishReceivedFile(msg);
+    if (currentReceivingMeta && msg.totalBytes && receivedBytes < msg.totalBytes) {
+      console.log(`[Transfer] FILE_COMPLETE recebido mas aguardando ${msg.totalBytes - receivedBytes} bytes restantes...`);
+      pendingCompletionMsg = msg;
+    } else {
+      finishReceivedFile(msg);
+    }
+  }
+  // 10.1 File Transfer Complete Acknowledged by Receiver
+  else if (msg.type === 'FILE_COMPLETE_ACK') {
+    if (typeof currentSendResolve === 'function') {
+      currentSendResolve();
+      currentSendResolve = null;
+    }
   }
   // 11. Transfer Cancelled
   else if (msg.type === 'TRANSFER_CANCELLED') {
@@ -1103,6 +1132,11 @@ function handleRelayChunk(msg) {
   if (currentReceivingMeta) {
     updateTransferProgress(receivedBytes, currentReceivingMeta.size);
   }
+  if (pendingCompletionMsg && receivedBytes >= pendingCompletionMsg.totalBytes) {
+    const comp = pendingCompletionMsg;
+    pendingCompletionMsg = null;
+    finishReceivedFile(comp);
+  }
 }
 
 // Complete and Save Received File
@@ -1110,14 +1144,23 @@ function finishReceivedFile(msg) {
   const fileName = currentReceivingMeta ? currentReceivingMeta.name : 'download';
   const fileSize = currentReceivingMeta ? currentReceivingMeta.size : receivedBytes;
   const fileMime = currentReceivingMeta ? currentReceivingMeta.mimeType : 'application/octet-stream';
+  const senderPeerId = currentReceivingMeta ? currentReceivingMeta.senderPeerId : '';
+
+  // Confirm receipt back to sender so sender marks complete accurately
+  if (senderPeerId) {
+    sendPeerAppMessage(senderPeerId, {
+      type: 'FILE_COMPLETE_ACK'
+    });
+  }
 
   // Create blob directly from chunks and trigger download
   // Do NOT call blob.arrayBuffer() — WebRTC DTLS/SCTP checksums already verify integrity
   const blob = new Blob(receivedChunks, { type: fileMime });
   downloadBlob(blob, fileName);
   receivedChunks = []; // Free memory immediately
+  pendingCompletionMsg = null;
 
-  const hashDisplay = msg.sha256 && !msg.sha256.startsWith('STREAM-')
+  const hashDisplay = msg && msg.sha256 && !msg.sha256.startsWith('STREAM-')
     ? '✓ ' + msg.sha256.substring(0, 16) + '... (Concluído)'
     : '✓ Transferência concluída';
 
@@ -1356,6 +1399,23 @@ function removePeer(peerId) {
           const targetPeer = connectedPeers.get(targetPeerId);
           if (!targetPeer) return;
 
+          // If DataChannel is still connecting, give it up to 6 seconds to open before deciding
+          if (targetPeer.dc && targetPeer.dc.readyState === 'connecting') {
+            console.log(`[Transfer] Aguardando DataChannel abrir com ${targetPeer.nickname}...`);
+            await new Promise(res => {
+              const checkInterval = setInterval(() => {
+                if (!targetPeer.dc || targetPeer.dc.readyState !== 'connecting') {
+                  clearInterval(checkInterval);
+                  res();
+                }
+              }, 100);
+              setTimeout(() => {
+                clearInterval(checkInterval);
+                res();
+              }, 6000);
+            });
+          }
+
           // Calculate SHA-256 for small files, or use streaming token for large files (> 32MB)
           // to prevent allocating gigabytes in the browser heap
           let sha256 = '';
@@ -1376,7 +1436,7 @@ function removePeer(peerId) {
           // ALWAYS prefer P2P DataChannel when it's actually open — even if mode label says 'relay'
           if (targetPeer.dc && targetPeer.dc.readyState === 'open') {
             console.log(`[Transfer] Enviando "${file.name}" (${formatBytes(file.size)}) via P2P DataChannel direto`);
-            await sendFileOverDataChannel(targetPeer.dc, file, sha256);
+            await sendFileOverDataChannel(targetPeer.dc, targetPeerId, file, sha256);
           } else {
             console.log(`[Transfer] Enviando "${file.name}" (${formatBytes(file.size)}) via Relay MQTT (conexão direta indisponível)`);
             await sendFileOverRelay(targetPeerId, file, sha256);
@@ -1392,10 +1452,10 @@ function removePeer(peerId) {
         }
 
 // Streaming Transfer over WebRTC DataChannel (Rock-solid async stream with active drain timer)
-async function sendFileOverDataChannel(dc, file, sha256) {
-  const CHUNK_SIZE = 32 * 1024;       // 32 KB: maximum compatibility and zero packet drop
-  const MAX_BUFFER = 512 * 1024;      // 512 KB: safe high-water mark for SCTP
-  const RESUME_BUFFER = 128 * 1024;   // 128 KB: low-water mark to resume sending
+async function sendFileOverDataChannel(dc, targetPeerId, file, sha256) {
+  const CHUNK_SIZE = 512 * 1024;       // 512 KB por chunk: throughput ultra-rápido
+  const MAX_BUFFER = 16 * 1024 * 1024; // 16 MB: buffer amplo para saturação de banda
+  const RESUME_BUFFER = 4 * 1024 * 1024; // 4 MB: retoma sem engasgar o pipeline
 
   try {
     dc.bufferedAmountLowThreshold = RESUME_BUFFER;
@@ -1407,6 +1467,7 @@ async function sendFileOverDataChannel(dc, file, sha256) {
     size: file.size,
     mimeType: file.type || 'application/octet-stream',
     sender: myNickname,
+    senderPeerId: myPeerId,
     sha256: sha256
   }));
 
@@ -1445,8 +1506,8 @@ async function sendFileOverDataChannel(dc, file, sha256) {
     });
   }
 
-  // Read from disk in 4 MB blocks (low RAM, fast sequential read)
-  const BLOCK_SIZE = 4 * 1024 * 1024;
+  // Read from disk in 64 MB blocks (ultra-rápido para arquivos de 1GB+, baixíssimo overhead)
+  const BLOCK_SIZE = 64 * 1024 * 1024;
   let offset = 0;
 
   while (offset < totalBytes) {
@@ -1497,17 +1558,32 @@ async function sendFileOverDataChannel(dc, file, sha256) {
 
   if (isAborted || currentTransferAborted) return;
 
-  // Wait until ALL remaining bytes in the socket are delivered
-  await waitDrain(0);
+  // Wait until ALL remaining bytes in the socket are completely flushed (bufferedAmount === 0)
+  while (dc.bufferedAmount > 0) {
+    if (isAborted || currentTransferAborted) return;
+    await new Promise(r => setTimeout(r, 15));
+  }
 
   if (isAborted || currentTransferAborted) return;
 
   try {
     dc.send(JSON.stringify({
       type: 'FILE_COMPLETE',
+      totalBytes: totalBytes,
       sha256: sha256
     }));
   } catch (e) { }
+
+  // Wait for the receiver to confirm full receipt and download (with 6s fallback safety)
+  await new Promise(resolve => {
+    currentSendResolve = resolve;
+    setTimeout(() => {
+      if (currentSendResolve === resolve) {
+        currentSendResolve = null;
+        resolve();
+      }
+    }, 6000);
+  });
 
   onSendComplete(sha256);
 }
@@ -1520,6 +1596,7 @@ async function sendFileOverDataChannel(dc, file, sha256) {
               size: file.size,
               mimeType: file.type || 'application/octet-stream',
               sender: myNickname,
+              senderPeerId: myPeerId,
               sha256: sha256
             });
 
@@ -1572,8 +1649,21 @@ async function sendFileOverDataChannel(dc, file, sha256) {
             if (!currentTransferAborted) {
               sendPeerAppMessage(targetPeerId, {
                 type: 'FILE_COMPLETE',
+                totalBytes: totalBytes,
                 sha256: sha256
               });
+
+              // Wait for receiver ACK
+              await new Promise(resolve => {
+                currentSendResolve = resolve;
+                setTimeout(() => {
+                  if (currentSendResolve === resolve) {
+                    currentSendResolve = null;
+                    resolve();
+                  }
+                }, 6000);
+              });
+
               onSendComplete(sha256);
             }
           }
