@@ -2,7 +2,7 @@
  * GhostDrop - Direct & Secure File Sharing and Real-time Chat
  */
 
-// WebRTC STUN Configuration (Servidores rápidos de resposta imediata)
+// WebRTC STUN Configuration
 const STUN_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
@@ -22,9 +22,9 @@ const MQTT_BROKERS = [
 ];
 let currentBrokerIndex = 0;
 
-const CHUNK_SIZE = 64 * 1024;          // 64 KB por chunk (máxima interoperabilidade WebRTC)
-const BUFFER_HIGH = 16 * 1024 * 1024;  // 16 MB: saturação total de banda para máxima velocidade
-const BUFFER_LOW = 4 * 1024 * 1024;    // 4 MB: retoma sem engasgar o pipeline
+const CHUNK_SIZE = 64 * 1024;          // 64 KB por chunk (padrão universal WebRTC para máxima compatibilidade)
+const BUFFER_HIGH = 4 * 1024 * 1024;   // 4 MB: pausa envio se exceder
+const BUFFER_LOW = 1 * 1024 * 1024;    // 1 MB: retoma envio quando buffer drenar abaixo disto
 
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
@@ -41,7 +41,7 @@ let activeSessionRoomCode = '';
 let heartbeatTimer = null;
 let inRoom = false;
 
-// Connected Peers Map: peerId -> { pc, dc, nickname, isPolite, state: 'connecting'|'connected', mode: 'p2p'|'relay', relayFallbackTimer, retryTimer, hasAnswer }
+// Connected Peers Map: peerId -> { pc, dc, nickname, isPolite, state: 'connecting'|'connected', hasAnswer }
 const connectedPeers = new Map();
 
 // Pending ICE Candidates queue: peerId -> [candidates]
@@ -59,8 +59,7 @@ let receivedBytes = 0;
 let transferStartTime = 0;
 let lastBytes = 0;
 let lastTime = 0;
-let pendingCompletionMsg = null;
-let currentTransferAborted = false;
+let pendingCompletion = null;
 let currentSendResolve = null;
 
 // Typing indicator state
@@ -120,7 +119,6 @@ const transferHash = document.getElementById('transferHash');
 const transferStatePill = document.getElementById('transferStatePill');
 const btnCancelTransfer = document.getElementById('btnCancelTransfer');
 const btnCloseTransferModal = document.getElementById('btnCloseTransferModal');
-const btnDownloadReceivedFile = document.getElementById('btnDownloadReceivedFile');
 
 const incomingModal = document.getElementById('incomingModal');
 const incomingModalFileName = document.getElementById('incomingModalFileName');
@@ -317,26 +315,6 @@ async function deriveKey(codeStr) {
   );
 }
 
-// Fast Base64 conversion helpers for binary transfers
-function uint8ToBase64(bytes) {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i += 1024) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 1024, len)));
-  }
-  return btoa(binary);
-}
-
-function base64ToUint8(base64) {
-  const binary = atob(base64);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
 async function encryptPayload(key, obj) {
   const enc = new TextEncoder();
   const data = enc.encode(JSON.stringify(obj));
@@ -348,19 +326,14 @@ async function encryptPayload(key, obj) {
   );
   return {
     iv: Array.from(iv),
-    payload: uint8ToBase64(new Uint8Array(encrypted))
+    payload: Array.from(new Uint8Array(encrypted))
   };
 }
 
 async function decryptPayload(key, encrypted) {
   try {
     const iv = new Uint8Array(encrypted.iv);
-    let data;
-    if (typeof encrypted.payload === 'string') {
-      data = base64ToUint8(encrypted.payload);
-    } else {
-      data = new Uint8Array(encrypted.payload);
-    }
+    const data = new Uint8Array(encrypted.payload);
     const decrypted = await crypto.subtle.decrypt(
       { name: 'AES-GCM', iv },
       key,
@@ -517,16 +490,10 @@ function setupEventListeners() {
   btnModalAccept.addEventListener('click', () => {
     incomingModal.classList.add('hidden');
     if (pendingIncomingOffer) {
-      const offer = pendingIncomingOffer;
-      pendingIncomingOffer = null;
-      receivedChunks = [];
-      receivedBytes = 0;
-      pendingCompletionMsg = null;
-      currentTransferAborted = false;
-      sendPeerAppMessage(offer.senderPeerId, {
+      sendPeerAppMessage(pendingIncomingOffer.senderPeerId, {
         type: 'FILE_OFFER_ACCEPTED',
-        fileId: offer.fileId,
-        targetPeerId: offer.senderPeerId,
+        fileId: pendingIncomingOffer.fileId,
+        targetPeerId: pendingIncomingOffer.senderPeerId,
         fromPeerId: myPeerId
       });
     }
@@ -549,12 +516,10 @@ function setupEventListeners() {
   btnCancelTransfer.addEventListener('click', () => {
     if (confirm('Deseja cancelar a transferência em andamento?')) {
       broadcastAppMessage({ type: 'TRANSFER_CANCELLED' });
-      currentTransferAborted = true;
       if (typeof currentSendResolve === 'function') {
         currentSendResolve();
         currentSendResolve = null;
       }
-      receivedChunks = [];
       transferOverlay.classList.add('hidden');
     }
   });
@@ -690,20 +655,11 @@ async function sendSignalingMessage(topic, msgObj) {
 function broadcastAppMessage(msgObj) {
   msgObj.fromPeerId = myPeerId;
   const raw = JSON.stringify(msgObj);
-  let directCount = 0;
-
   connectedPeers.forEach(peer => {
-    if (peer.state === 'connected' && peer.mode === 'p2p' && peer.dc && peer.dc.readyState === 'open') {
+    if (peer.dc && peer.dc.readyState === 'open') {
       try {
         peer.dc.send(raw);
-        directCount++;
       } catch (e) { }
-    } else {
-      sendSignalingMessage(currentSignalingTopic, {
-        type: 'RELAY_MSG',
-        targetPeerId: peer.peerId,
-        content: msgObj
-      });
     }
   });
 }
@@ -711,17 +667,11 @@ function broadcastAppMessage(msgObj) {
 function sendPeerAppMessage(targetPeerId, msgObj) {
   msgObj.fromPeerId = myPeerId;
   const peer = connectedPeers.get(targetPeerId);
-  if (peer && peer.mode === 'p2p' && peer.dc && peer.dc.readyState === 'open') {
+  if (peer && peer.dc && peer.dc.readyState === 'open') {
     try {
       peer.dc.send(JSON.stringify(msgObj));
-      return;
     } catch (e) { }
   }
-  sendSignalingMessage(currentSignalingTopic, {
-    type: 'RELAY_MSG',
-    targetPeerId: targetPeerId,
-    content: msgObj
-  });
 }
 
 // Handle Incoming Signaling Messages
@@ -775,11 +725,6 @@ async function handleSignalingMessage(msg) {
   else if (msg.type === 'ICE' && msg.targetPeerId === myPeerId) {
     await handleIceCandidate(senderId, msg.candidate);
   }
-
-  // 6. Seamless Fallback Relay Message
-  else if (msg.type === 'RELAY_MSG' && (msg.targetPeerId === myPeerId || !msg.targetPeerId)) {
-    onDataMessage(senderId, msg.content);
-  }
 }
 
 function getOrCreatePeer(peerId, nickname, isPolite) {
@@ -806,44 +751,18 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
     dc: dc,
     nickname: targetNickname,
     isPolite: isPolite,
-    makingOffer: false,
-    ignoreOffer: false,
     state: 'connecting',
-    mode: 'p2p',
-    relayFallbackTimer: null,
-    retryTimer: null
+    hasAnswer: false
   };
   connectedPeers.set(targetPeerId, peerObj);
   renderParticipantsList();
 
-  function markConnected(mode = 'p2p') {
-    // Se o DataChannel estiver aberto, a conexão é garantidamente P2P
-    if (peerObj.dc && peerObj.dc.readyState === 'open') {
-      mode = 'p2p';
-    }
-    const stateChanged = peerObj.state !== 'connected' || peerObj.mode !== mode;
-    peerObj.state = 'connected';
-    peerObj.mode = mode;
-    if (stateChanged) {
+  function markConnected() {
+    if (peerObj.state !== 'connected') {
+      peerObj.state = 'connected';
       renderParticipantsList();
     }
-    if (peerObj.relayFallbackTimer) {
-      clearTimeout(peerObj.relayFallbackTimer);
-      peerObj.relayFallbackTimer = null;
-    }
-    if (peerObj.retryTimer) {
-      clearInterval(peerObj.retryTimer);
-      peerObj.retryTimer = null;
-    }
   }
-
-  // Fallback timer: só aciona o relay de contingência se o canal P2P não abrir em 12 segundos
-  peerObj.relayFallbackTimer = setTimeout(() => {
-    if (peerObj.state !== 'connected' && (!peerObj.dc || peerObj.dc.readyState !== 'open')) {
-      markConnected('relay');
-      appendSystemMessage(`🛡️ Conexão de contingência estabelecida com <strong>${escapeHtml(peerObj.nickname)}</strong>.`);
-    }
-  }, 12000);
 
   setupDataChannelListeners(targetPeerId, dc, markConnected);
 
@@ -860,7 +779,7 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
         type: 'ICE',
         targetPeerId: targetPeerId,
         fromPeerId: myPeerId,
-        candidate: event.candidate.toJSON ? event.candidate.toJSON() : {
+        candidate: {
           candidate: event.candidate.candidate,
           sdpMid: event.candidate.sdpMid,
           sdpMLineIndex: event.candidate.sdpMLineIndex
@@ -870,28 +789,10 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
   };
 
   pc.onconnectionstatechange = () => {
-    console.log(`[WebRTC] ${targetPeerId} connectionState:`, pc.connectionState);
     if (pc.connectionState === 'connected') {
-      markConnected('p2p');
+      markConnected();
     } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-      if (peerObj.dc && peerObj.dc.readyState === 'open') {
-        markConnected('p2p');
-      } else {
-        markConnected('relay');
-      }
-    }
-  };
-
-  pc.oniceconnectionstatechange = () => {
-    console.log(`[WebRTC] ${targetPeerId} iceConnectionState:`, pc.iceConnectionState);
-    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-      markConnected('p2p');
-    } else if (pc.iceConnectionState === 'failed') {
-      if (peerObj.dc && peerObj.dc.readyState === 'open') {
-        markConnected('p2p');
-      } else {
-        markConnected('relay');
-      }
+      removePeer(targetPeerId);
     }
   };
 
@@ -900,10 +801,8 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
 
 async function initiateOffer(targetPeerId) {
   const peer = connectedPeers.get(targetPeerId);
-  if (!peer || peer.makingOffer) return;
+  if (!peer) return;
   try {
-    peer.makingOffer = true;
-    if (peer.pc.signalingState !== 'stable') return;
     const offer = await peer.pc.createOffer();
     await peer.pc.setLocalDescription(offer);
     sendSignalingMessage(currentSignalingTopic, {
@@ -915,8 +814,6 @@ async function initiateOffer(targetPeerId) {
     });
   } catch (err) {
     console.warn(`[WebRTC] Erro ao criar oferta para ${targetPeerId}:`, err);
-  } finally {
-    peer.makingOffer = false;
   }
 }
 
@@ -926,22 +823,15 @@ async function handleOffer(targetPeerId, offerSdp) {
 
   try {
     const pc = peer.pc;
-    const isCollision = (pc.signalingState !== 'stable') || peer.makingOffer;
+    const isCollision = (pc.signalingState !== 'stable') || peer.hasAnswer;
 
-    peer.ignoreOffer = !peer.isPolite && isCollision;
-    if (peer.ignoreOffer) {
-      console.log(`[WebRTC] Colisão detectada com ${targetPeerId}. Sou impolite, ignorando oferta remota.`);
+    if (isCollision && !peer.isPolite) {
       return;
-    }
-
-    if (isCollision && peer.isPolite) {
-      console.log(`[WebRTC] Colisão detectada com ${targetPeerId}. Sou polite, aplicando rollback.`);
-      await pc.setLocalDescription({ type: 'rollback' }).catch(() => {});
     }
 
     await pc.setRemoteDescription(new RTCSessionDescription(offerSdp));
 
-    // Process queued ICE candidates
+    // Process any queued ICE candidates
     if (pendingIceCandidates.has(targetPeerId)) {
       const candidates = pendingIceCandidates.get(targetPeerId);
       for (const c of candidates) {
@@ -952,6 +842,7 @@ async function handleOffer(targetPeerId, offerSdp) {
 
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
+    peer.hasAnswer = true;
 
     sendSignalingMessage(currentSignalingTopic, {
       type: 'ANSWER',
@@ -972,8 +863,9 @@ async function handleAnswer(targetPeerId, answerSdp) {
     const pc = peer.pc;
     if (pc.signalingState === 'have-local-offer') {
       await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
+      peer.hasAnswer = true;
 
-      // Process queued ICE candidates
+      // Process any queued ICE candidates
       if (pendingIceCandidates.has(targetPeerId)) {
         const candidates = pendingIceCandidates.get(targetPeerId);
         for (const c of candidates) {
@@ -989,7 +881,7 @@ async function handleAnswer(targetPeerId, answerSdp) {
 
 async function handleIceCandidate(targetPeerId, candidateObj) {
   const peer = connectedPeers.get(targetPeerId);
-  if (!peer || !peer.pc || !peer.pc.remoteDescription || !peer.pc.remoteDescription.type) {
+  if (!peer || !peer.pc.remoteDescription || !peer.pc.remoteDescription.type) {
     if (!pendingIceCandidates.has(targetPeerId)) {
       pendingIceCandidates.set(targetPeerId, []);
     }
@@ -1004,18 +896,8 @@ async function handleIceCandidate(targetPeerId, candidateObj) {
 // Data Channel Handlers
 function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
   channel.onopen = () => {
-    console.log(`[DataChannel] Canal de dados aberto com ${targetPeerId}! Modo P2P ativo.`);
     const peer = connectedPeers.get(targetPeerId);
-    if (peer) {
-      peer.state = 'connected';
-      peer.mode = 'p2p';
-      if (peer.relayFallbackTimer) {
-        clearTimeout(peer.relayFallbackTimer);
-        peer.relayFallbackTimer = null;
-      }
-      renderParticipantsList();
-    }
-    if (onConnectedCallback) onConnectedCallback('p2p');
+    if (onConnectedCallback) onConnectedCallback();
 
     try {
       channel.send(JSON.stringify({
@@ -1026,25 +908,15 @@ function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
     } catch (e) { }
 
     const peerNick = peer ? peer.nickname : 'Participante';
-    appendSystemMessage(`⚡ <strong>${escapeHtml(peerNick)}</strong> conectado via P2P direto (alta velocidade).`);
+    appendSystemMessage(`⚡ <strong>${escapeHtml(peerNick)}</strong> conectou-se diretamente (P2P).`);
   };
 
   channel.onclose = () => {
-    const peer = connectedPeers.get(targetPeerId);
-    if (peer && peer.state === 'connected') {
-      peer.mode = 'relay';
-      renderParticipantsList();
-    } else {
-      removePeer(targetPeerId);
-    }
+    removePeer(targetPeerId);
   };
 
-  channel.onerror = () => {
-    const peer = connectedPeers.get(targetPeerId);
-    if (peer) {
-      peer.mode = 'relay';
-      renderParticipantsList();
-    }
+  channel.onerror = (err) => {
+    console.warn(`[DataChannel] Erro com ${targetPeerId}:`, err);
   };
 
   channel.onmessage = (event) => {
@@ -1055,11 +927,10 @@ function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
       if (currentReceivingMeta) {
         updateTransferProgress(receivedBytes, currentReceivingMeta.size);
       }
-      // Se FILE_COMPLETE já foi recebido antes de todos os chunks terminarem
-      if (pendingCompletionMsg && currentReceivingMeta && receivedBytes >= currentReceivingMeta.size) {
-        const comp = pendingCompletionMsg;
-        pendingCompletionMsg = null;
-        finishReceivedFile(comp);
+      if (pendingCompletion && currentReceivingMeta && receivedBytes >= currentReceivingMeta.size) {
+        const comp = pendingCompletion;
+        pendingCompletion = null;
+        finishReceivedFile(comp, targetPeerId);
       }
       return;
     }
@@ -1127,32 +998,24 @@ function onDataMessage(fromPeerId, msg) {
   // 8. File Metadata
   else if (msg.type === 'FILE_META') {
     currentReceivingMeta = msg;
-    currentReceivingMeta.senderPeerId = fromPeerId;
     receivedChunks = [];
     receivedBytes = 0;
-    pendingCompletionMsg = null;
-    currentTransferAborted = false;
+    pendingCompletion = null;
     transferStartTime = Date.now();
     lastBytes = 0;
     lastTime = Date.now();
     openTransferModal(msg.name, msg.size, 'Recebendo Arquivo...');
   }
-  // 9. Relay File Chunk
-  else if (msg.type === 'FILE_CHUNK_RELAY') {
-    handleRelayChunk(msg);
-  }
-  // 10. File Transfer Completed
+  // 9. File Transfer Completed
   else if (msg.type === 'FILE_COMPLETE') {
-    if (currentReceivingMeta && msg.totalBytes && receivedBytes < msg.totalBytes) {
-      console.log(`[Transfer] FILE_COMPLETE recebido: ${receivedBytes} de ${msg.totalBytes} bytes. Aguardando pacotes restantes...`);
-      pendingCompletionMsg = msg;
+    if (currentReceivingMeta && receivedBytes < currentReceivingMeta.size) {
+      pendingCompletion = msg;
     } else {
-      finishReceivedFile(msg);
+      finishReceivedFile(msg, fromPeerId);
     }
   }
-  // 10.1 File Transfer Complete Acknowledged by Receiver
+  // 10. File Transfer Acknowledged by Receiver
   else if (msg.type === 'FILE_COMPLETE_ACK') {
-    console.log('[Transfer] Handshake concluído: Destinatário confirmou recebimento!');
     if (typeof currentSendResolve === 'function') {
       currentSendResolve();
       currentSendResolve = null;
@@ -1160,96 +1023,61 @@ function onDataMessage(fromPeerId, msg) {
   }
   // 11. Transfer Cancelled
   else if (msg.type === 'TRANSFER_CANCELLED') {
-    currentTransferAborted = true;
-    if (typeof currentSendResolve === 'function') {
-      currentSendResolve();
-      currentSendResolve = null;
-    }
-    receivedChunks = [];
-    alert('A transferência foi cancelada pelo outro participante.');
+    alert('A transferência foi cancelada.');
     transferOverlay.classList.add('hidden');
   }
 }
 
-// Handle Relayed File Chunk
-function handleRelayChunk(msg) {
-  let chunkBuffer = null;
-  if (msg.chunkB64) {
-    chunkBuffer = base64ToUint8(msg.chunkB64).buffer;
-  } else if (msg.chunk) {
-    chunkBuffer = new Uint8Array(msg.chunk).buffer;
-  }
-  if (!chunkBuffer) return;
-
-  receivedChunks.push(chunkBuffer);
-  receivedBytes += chunkBuffer.byteLength;
-  if (currentReceivingMeta) {
-    updateTransferProgress(receivedBytes, currentReceivingMeta.size);
-  }
-  if (pendingCompletionMsg && currentReceivingMeta && receivedBytes >= currentReceivingMeta.size) {
-    const comp = pendingCompletionMsg;
-    pendingCompletionMsg = null;
-    finishReceivedFile(comp);
-  }
-}
-
 // Complete and Save Received File
-async function finishReceivedFile(msg) {
-  const meta = currentReceivingMeta;
-  const fileName = meta ? meta.name : 'download';
-  const mimeType = meta ? meta.mimeType : 'application/octet-stream';
-
-  const blob = new Blob(receivedChunks, { type: mimeType });
+async function finishReceivedFile(msg, senderPeerId) {
+  const blob = new Blob(receivedChunks, { type: currentReceivingMeta ? currentReceivingMeta.mimeType : 'application/octet-stream' });
   const arrayBuffer = await blob.arrayBuffer();
   const calculatedHash = await computeHash(arrayBuffer);
 
-  const isValid = !msg.sha256 || (calculatedHash.toLowerCase() === msg.sha256.toLowerCase());
-  if (isValid) {
+  if (msg.sha256 && calculatedHash.toLowerCase() === msg.sha256.toLowerCase()) {
     transferHash.textContent = '✓ ' + calculatedHash.substring(0, 16) + '... (Válido)';
     transferHash.style.color = '#10b981';
   } else {
-    transferHash.textContent = calculatedHash.substring(0, 16) + '... (Hash divergente)';
-    transferHash.style.color = '#f43f5e';
+    transferHash.textContent = calculatedHash.substring(0, 16) + '...';
   }
 
   const blobUrl = URL.createObjectURL(blob);
 
-  // Send ACK to sender so sender marks complete
-  const senderId = (meta && meta.senderPeerId) ? meta.senderPeerId : msg.fromPeerId;
-  if (senderId) {
-    sendPeerAppMessage(senderId, {
-      type: 'FILE_COMPLETE_ACK',
-      fileId: meta ? meta.fileId : null,
-      sha256: calculatedHash
-    });
+  // Download automático
+  downloadBlob(blob, currentReceivingMeta ? currentReceivingMeta.name : 'download');
+
+  // Habilita botão manual de Salvar no modal
+  const btnSave = document.getElementById('btnDownloadReceivedFile');
+  if (btnSave) {
+    btnSave.href = blobUrl;
+    btnSave.download = currentReceivingMeta ? currentReceivingMeta.name : 'download';
+    btnSave.classList.remove('hidden');
   }
 
-  // Add to session history with direct download URL
+  // Add to session history
   addTransferToHistory({
-    name: fileName,
-    size: meta ? meta.size : receivedBytes,
+    name: currentReceivingMeta ? currentReceivingMeta.name : 'arquivo',
+    size: currentReceivingMeta ? currentReceivingMeta.size : receivedBytes,
     direction: 'received',
     sha256: calculatedHash,
-    sender: meta ? meta.sender : 'Participante',
+    sender: currentReceivingMeta ? currentReceivingMeta.sender : 'Participante',
     blobUrl: blobUrl
   });
 
   progressBarFill.style.width = '100%';
   transferPercent.textContent = '100%';
-  transferStatePill.textContent = 'Recebido com Sucesso!';
+  transferStatePill.textContent = 'Concluído!';
   transferStatePill.style.background = 'rgba(16, 185, 129, 0.2)';
   transferStatePill.style.color = '#6ee7b7';
   btnCloseTransferModal.classList.remove('hidden');
   btnCancelTransfer.classList.add('hidden');
 
-  // Trigger automatic download
-  downloadBlob(blob, fileName);
-
-  // Surface manual download button in modal
-  if (btnDownloadReceivedFile) {
-    btnDownloadReceivedFile.href = blobUrl;
-    btnDownloadReceivedFile.download = fileName;
-    btnDownloadReceivedFile.classList.remove('hidden');
+  // Confirmação de recebimento para o remetente
+  if (senderPeerId) {
+    sendPeerAppMessage(senderPeerId, {
+      type: 'FILE_COMPLETE_ACK',
+      sha256: msg.sha256
+    });
   }
 }
 
@@ -1257,8 +1085,6 @@ async function finishReceivedFile(msg) {
 function removePeer(peerId) {
   const peer = connectedPeers.get(peerId);
   if (peer) {
-    if (peer.relayFallbackTimer) clearTimeout(peer.relayFallbackTimer);
-    if (peer.retryTimer) clearInterval(peer.retryTimer);
     if (peer.state === 'connected') {
       appendSystemMessage(`🚪 <strong>${escapeHtml(peer.nickname)}</strong> desconectou-se da sala.`);
     }
@@ -1324,22 +1150,14 @@ function renderParticipantsList() {
 
   // 2. Add Connected/Connecting Peers
   connectedPeers.forEach((peer) => {
-    const isDirect = peer.dc && peer.dc.readyState === 'open';
-    const isConn = peer.state === 'connected' || isDirect;
-    let badgeHtml = '';
-    if (isDirect) {
-      badgeHtml = `<span style="font-size:0.75rem; margin-left:6px; color:#10b981; font-weight:700;">⚡ P2P Direto</span>`;
-    } else if (isConn) {
-      badgeHtml = `<span style="font-size:0.75rem; margin-left:6px; color:#f59e0b; font-weight:600;">🛡️ Relay</span>`;
-    } else {
-      badgeHtml = `<small style="opacity:0.65; font-size:0.75rem; margin-left:4px; color:#fb7185;">(conectando...)</small>`;
-    }
+    const isConn = peer.state === 'connected';
+    const statusText = isConn ? '' : `<small style="opacity:0.65; font-size:0.75rem; margin-left:4px; color:#fb7185;">(conectando...)</small>`;
 
     const chip = document.createElement('div');
     chip.className = 'peer-chip';
     chip.innerHTML = `
       <span class="peer-chip-avatar" style="background:${getNicknameColor(peer.nickname)};"></span>
-      <span>${escapeHtml(peer.nickname)} ${badgeHtml}</span>
+      <span>${escapeHtml(peer.nickname)} ${statusText}</span>
     `;
     participantsChips.appendChild(chip);
   });
@@ -1467,7 +1285,7 @@ function offerNextFile() {
   appendSystemMessage(`📤 Oferta de arquivo enviada: <strong>${escapeHtml(file.name)}</strong> (${formatBytes(file.size)}).`);
 }
 
-// Send File Stream to Specific Peer
+// Send File Stream to Specific Peer (100% P2P Direto)
 async function startSendingNextQueuedFile(targetPeerId) {
   if (pendingSendQueue.length === 0) return;
   const file = pendingSendQueue.shift();
@@ -1481,11 +1299,23 @@ async function startSendingNextQueuedFile(targetPeerId) {
   openTransferModal(file.name, file.size, 'Enviando Arquivo...');
 
   if (targetPeer.dc && targetPeer.dc.readyState === 'open') {
-    targetPeer.mode = 'p2p';
     await sendFileOverDataChannel(targetPeer.dc, targetPeerId, file, arrayBuffer, sha256);
   } else {
-    targetPeer.mode = 'relay';
-    await sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256);
+    // Aguarda o canal P2P abrir se ainda estiver conectando
+    openTransferModal(file.name, file.size, 'Aguardando canal P2P direto...');
+    let waited = 0;
+    while ((!targetPeer.dc || targetPeer.dc.readyState !== 'open') && waited < 5000) {
+      await new Promise(r => setTimeout(r, 200));
+      waited += 200;
+    }
+    if (targetPeer.dc && targetPeer.dc.readyState === 'open') {
+      openTransferModal(file.name, file.size, 'Enviando Arquivo...');
+      await sendFileOverDataChannel(targetPeer.dc, targetPeerId, file, arrayBuffer, sha256);
+    } else {
+      alert('A conexão direta P2P com este participante não está aberta.');
+      transferOverlay.classList.add('hidden');
+      return;
+    }
   }
 
   addTransferToHistory({
@@ -1497,19 +1327,16 @@ async function startSendingNextQueuedFile(targetPeerId) {
   });
 }
 
-// Streaming Transfer over WebRTC DataChannel (Rock-solid async stream with active drain & completion ACK)
+// Streaming Transfer over WebRTC DataChannel (100% P2P Direto de Alta Velocidade)
 async function sendFileOverDataChannel(dc, targetPeerId, file, arrayBuffer, sha256) {
-  currentTransferAborted = false;
-
-  const fileMeta = {
+  dc.send(JSON.stringify({
     type: 'FILE_META',
     name: file.name,
     size: file.size,
     mimeType: file.type || 'application/octet-stream',
     sender: myNickname,
     sha256: sha256
-  };
-  dc.send(JSON.stringify(fileMeta));
+  }));
 
   const totalBytes = arrayBuffer.byteLength;
   let offset = 0;
@@ -1517,187 +1344,60 @@ async function sendFileOverDataChannel(dc, targetPeerId, file, arrayBuffer, sha2
   lastBytes = 0;
   lastTime = Date.now();
 
-  function waitDrain(targetThreshold) {
-    return new Promise((resolve) => {
-      if (dc.bufferedAmount <= targetThreshold) {
-        resolve();
-        return;
-      }
-      let resolved = false;
-      const cleanup = () => {
-        if (resolved) return;
-        resolved = true;
-        dc.removeEventListener('bufferedamountlow', onLow);
-        clearInterval(pollTimer);
-        resolve();
-      };
-      const onLow = () => cleanup();
-      dc.bufferedAmountLowThreshold = targetThreshold;
-      dc.addEventListener('bufferedamountlow', onLow, { once: true });
+  const CHUNK_SIZE = 64 * 1024;        // 64 KB por chunk (universal para WebRTC DataChannel)
+  const BUFFER_HIGH = 4 * 1024 * 1024; // 4 MB limite de pausa
+  const BUFFER_LOW = 1 * 1024 * 1024;  // 1 MB limite de retomada
+  dc.bufferedAmountLowThreshold = BUFFER_LOW;
 
-      const pollTimer = setInterval(() => {
-        if (dc.bufferedAmount <= targetThreshold || dc.readyState !== 'open') {
-          cleanup();
+  await new Promise((resolve) => {
+    function sendSlice() {
+      while (offset < totalBytes) {
+        if (dc.bufferedAmount > BUFFER_HIGH) {
+          dc.onbufferedamountlow = () => {
+            dc.onbufferedamountlow = null;
+            sendSlice();
+          };
+          return;
         }
-      }, 15);
-    });
-  }
 
-  while (offset < totalBytes) {
-    if (currentTransferAborted) return;
-
-    if (dc.bufferedAmount >= BUFFER_HIGH) {
-      await waitDrain(BUFFER_LOW);
-    }
-
-    const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
-    try {
-      dc.send(chunk);
-    } catch (err) {
-      console.warn('[DataChannel] Erro ao enviar chunk, aguardando drenagem...', err);
-      await waitDrain(BUFFER_LOW);
-      await new Promise(r => setTimeout(r, 20));
-      try {
+        const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
         dc.send(chunk);
-      } catch (retryErr) {
-        console.error('[DataChannel] Falha crítica ao enviar chunk:', retryErr);
-        alert('Falha na conexão durante o envio do arquivo.');
-        return;
+        offset += chunk.byteLength;
+        updateTransferProgress(offset, totalBytes);
       }
+
+      // Aguarda todos os dados saírem do buffer de rede antes de avisar conclusão
+      async function waitForDrainAndAck() {
+        while (dc.bufferedAmount > 0) {
+          const sent = Math.max(0, totalBytes - dc.bufferedAmount);
+          updateTransferProgress(sent, totalBytes);
+          await new Promise(r => setTimeout(r, 20));
+        }
+        updateTransferProgress(totalBytes, totalBytes);
+
+        // Envia sinal de término pelo canal de dados P2P
+        dc.send(JSON.stringify({
+          type: 'FILE_COMPLETE',
+          totalBytes: totalBytes,
+          sha256: sha256
+        }));
+
+        transferStatePill.textContent = 'Aguardando confirmação do destinatário...';
+
+        // Aguarda confirmação do destinatário (com timeout de segurança)
+        currentSendResolve = resolve;
+        setTimeout(() => {
+          if (currentSendResolve === resolve) {
+            currentSendResolve = null;
+            resolve();
+          }
+        }, 10000);
+      }
+
+      waitForDrainAndAck();
     }
 
-    offset += chunk.byteLength;
-    const actualSentBytes = Math.max(0, offset - dc.bufferedAmount);
-    updateTransferProgress(actualSentBytes, totalBytes);
-  }
-
-  // Drena todo o buffer pendente do socket WebRTC antes de enviar confirmação
-  while (dc.bufferedAmount > 0 && dc.readyState === 'open' && !currentTransferAborted) {
-    const actualSentBytes = Math.max(0, totalBytes - dc.bufferedAmount);
-    updateTransferProgress(actualSentBytes, totalBytes);
-    await waitDrain(0);
-  }
-
-  if (currentTransferAborted) return;
-  updateTransferProgress(totalBytes, totalBytes);
-
-  transferStatePill.textContent = 'Aguardando confirmação do destinatário...';
-  transferStatePill.style.background = 'rgba(245, 158, 11, 0.2)';
-  transferStatePill.style.color = '#fbbf24';
-
-  const compPayload = {
-    type: 'FILE_COMPLETE',
-    totalBytes: totalBytes,
-    sha256: sha256
-  };
-
-  try {
-    dc.send(JSON.stringify(compPayload));
-  } catch (e) { }
-
-  // Redundância garantida via sinalização/app
-  sendPeerAppMessage(targetPeerId, compPayload);
-
-  // Aguarda ACK de recebimento e integridade do destinatário
-  await new Promise(resolve => {
-    currentSendResolve = resolve;
-    let attempts = 0;
-    const ackInterval = setInterval(() => {
-      attempts++;
-      if (currentSendResolve === null || currentTransferAborted) {
-        clearInterval(ackInterval);
-        return;
-      }
-      if (attempts >= 60) { // 30s de tolerância
-        clearInterval(ackInterval);
-        if (typeof currentSendResolve === 'function') {
-          currentSendResolve();
-          currentSendResolve = null;
-        }
-        return;
-      }
-      try { dc.send(JSON.stringify(compPayload)); } catch (e) { }
-    }, 500);
-  });
-
-  onSendComplete(sha256);
-}
-
-// Fallback Relay File Sending (Safe chunks with Base64 & ACK Handshake)
-async function sendFileOverRelay(targetPeerId, file, arrayBuffer, sha256) {
-  currentTransferAborted = false;
-
-  sendPeerAppMessage(targetPeerId, {
-    type: 'FILE_META',
-    name: file.name,
-    size: file.size,
-    mimeType: file.type || 'application/octet-stream',
-    sender: myNickname,
-    sha256: sha256
-  });
-
-  const totalBytes = arrayBuffer.byteLength;
-  let offset = 0;
-  // 32 KB chunks -> Base64 string ~43KB -> seguro e muito mais veloz para MQTT
-  const relayChunkSize = 32 * 1024;
-  transferStartTime = Date.now();
-  lastBytes = 0;
-  lastTime = Date.now();
-
-  while (offset < totalBytes) {
-    if (currentTransferAborted) return;
-
-    if (!mqttClient || !mqttClient.connected) {
-      await new Promise(r => setTimeout(r, 400));
-      continue;
-    }
-
-    const chunk = arrayBuffer.slice(offset, offset + relayChunkSize);
-    const chunkBytes = new Uint8Array(chunk);
-    const base64Chunk = uint8ToBase64(chunkBytes);
-
-    sendPeerAppMessage(targetPeerId, {
-      type: 'FILE_CHUNK_RELAY',
-      chunkB64: base64Chunk
-    });
-
-    offset += chunk.byteLength;
-    updateTransferProgress(offset, totalBytes);
-    await new Promise(r => setTimeout(r, 8));
-  }
-
-  if (currentTransferAborted) return;
-
-  transferStatePill.textContent = 'Aguardando confirmação do destinatário...';
-  transferStatePill.style.background = 'rgba(245, 158, 11, 0.2)';
-  transferStatePill.style.color = '#fbbf24';
-
-  const compPayload = {
-    type: 'FILE_COMPLETE',
-    totalBytes: totalBytes,
-    sha256: sha256
-  };
-  sendPeerAppMessage(targetPeerId, compPayload);
-
-  await new Promise(resolve => {
-    currentSendResolve = resolve;
-    let attempts = 0;
-    const interval = setInterval(() => {
-      attempts++;
-      if (currentSendResolve === null || currentTransferAborted) {
-        clearInterval(interval);
-        return;
-      }
-      if (attempts >= 60) {
-        clearInterval(interval);
-        if (typeof currentSendResolve === 'function') {
-          currentSendResolve();
-          currentSendResolve = null;
-        }
-        return;
-      }
-      sendPeerAppMessage(targetPeerId, compPayload);
-    }, 500);
+    sendSlice();
   });
 
   onSendComplete(sha256);
@@ -1708,12 +1408,13 @@ function onSendComplete(sha256) {
   transferHash.style.color = '#10b981';
   progressBarFill.style.width = '100%';
   transferPercent.textContent = '100%';
-  transferStatePill.textContent = 'Enviado com Sucesso!';
+  transferStatePill.textContent = 'Concluído com Sucesso!';
   transferStatePill.style.background = 'rgba(16, 185, 129, 0.2)';
   transferStatePill.style.color = '#6ee7b7';
   btnCloseTransferModal.classList.remove('hidden');
   btnCancelTransfer.classList.add('hidden');
-  if (btnDownloadReceivedFile) btnDownloadReceivedFile.classList.add('hidden');
+  const btnSave = document.getElementById('btnDownloadReceivedFile');
+  if (btnSave) btnSave.classList.add('hidden');
 
   if (pendingSendQueue.length > 0) {
     setTimeout(offerNextFile, 500);
@@ -1746,7 +1447,7 @@ function renderTransfersList() {
 
     let actionBtn = '';
     if (item.direction === 'received' && item.blobUrl) {
-      actionBtn = `<a href="${item.blobUrl}" download="${escapeHtml(item.name)}" class="btn-action-small" style="text-decoration:none;margin-left:auto;margin-right:8px;padding:4px 10px;font-size:0.8rem;background:#10b981;color:#fff;border-radius:6px;display:inline-flex;align-items:center;gap:4px;" title="Baixar novamente">⬇️ Salvar</a>`;
+      actionBtn = `<a href="${item.blobUrl}" download="${escapeHtml(item.name)}" class="btn-action-small" style="text-decoration:none;margin-left:auto;margin-right:8px;padding:4px 10px;font-size:0.8rem;background:#10b981;color:#fff;border-radius:6px;display:inline-flex;align-items:center;gap:4px;" title="Baixar arquivo">⬇️ Salvar</a>`;
     }
 
     card.innerHTML = `
@@ -1805,32 +1506,28 @@ function openTransferModal(fileName, fileSize, title) {
   transferStatePill.style.color = '#fda4af';
   btnCancelTransfer.classList.remove('hidden');
   btnCloseTransferModal.classList.add('hidden');
-  if (btnDownloadReceivedFile) btnDownloadReceivedFile.classList.add('hidden');
+  const btnSave = document.getElementById('btnDownloadReceivedFile');
+  if (btnSave) btnSave.classList.add('hidden');
   transferOverlay.classList.remove('hidden');
 }
 
 // Download file blob directly
 function downloadBlob(blob, fileName) {
-  try {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.style.display = 'none';
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => {
-      try { document.body.removeChild(a); } catch (e) { }
-      setTimeout(() => { URL.revokeObjectURL(url); }, 60000);
-    }, 1500);
-  } catch (err) {
-    console.warn('[Download] Download automático bloqueado pelo navegador:', err);
-  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.style.display = 'none';
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    try { document.body.removeChild(a); } catch (e) { }
+    setTimeout(() => { URL.revokeObjectURL(url); }, 60000);
+  }, 1000);
 }
 
 // Reset All Connections
 function resetAllConnections() {
-  currentTransferAborted = true;
   if (typeof currentSendResolve === 'function') {
     currentSendResolve();
     currentSendResolve = null;
