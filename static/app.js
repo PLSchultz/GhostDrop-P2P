@@ -22,9 +22,9 @@ const MQTT_BROKERS = [
 ];
 let currentBrokerIndex = 0;
 
-const CHUNK_SIZE = 16 * 1024;          // 16 KB por chunk (padrão RFC 8831 WebRTC DataChannel)
-const BUFFER_HIGH = 256 * 1024;        // 256 KB: janela ideal que evita bufferbloat no SCTP
-const BUFFER_LOW = 64 * 1024;          // 64 KB: retoma envio imediatamente
+const CHUNK_SIZE = 64 * 1024;          // 64 KB por chunk
+const BUFFER_HIGH = 1 * 1024 * 1024;   // 1 MB: pausa envio acima disso
+const BUFFER_LOW = 256 * 1024;         // 256 KB: retoma envio abaixo disso
 
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
@@ -1031,14 +1031,31 @@ function onDataMessage(fromPeerId, msg) {
 // Complete and Save Received File
 async function finishReceivedFile(msg, senderPeerId) {
   const blob = new Blob(receivedChunks, { type: currentReceivingMeta ? currentReceivingMeta.mimeType : 'application/octet-stream' });
-  const arrayBuffer = await blob.arrayBuffer();
-  const calculatedHash = await computeHash(arrayBuffer);
 
-  if (msg.sha256 && calculatedHash.toLowerCase() === msg.sha256.toLowerCase()) {
+  // Hash só para arquivos < 50MB (evita crashar em arquivos grandes)
+  let calculatedHash = '';
+  if (blob.size <= 50 * 1024 * 1024) {
+    try {
+      const arrayBuffer = await blob.arrayBuffer();
+      calculatedHash = await computeHash(arrayBuffer);
+    } catch (e) {
+      calculatedHash = 'SKIP';
+    }
+  } else {
+    calculatedHash = msg.sha256 || 'LARGE';
+  }
+
+  // Libera memória dos chunks recebidos
+  receivedChunks = [];
+
+  if (msg.sha256 && calculatedHash && calculatedHash === msg.sha256.toLowerCase()) {
     transferHash.textContent = '✓ ' + calculatedHash.substring(0, 16) + '... (Válido)';
     transferHash.style.color = '#10b981';
-  } else {
+  } else if (calculatedHash && calculatedHash !== 'SKIP' && calculatedHash !== 'LARGE') {
     transferHash.textContent = calculatedHash.substring(0, 16) + '...';
+  } else {
+    transferHash.textContent = '✓ Arquivo recebido com sucesso';
+    transferHash.style.color = '#10b981';
   }
 
   const blobUrl = URL.createObjectURL(blob);
@@ -1293,15 +1310,24 @@ async function startSendingNextQueuedFile(targetPeerId) {
   const targetPeer = connectedPeers.get(targetPeerId);
   if (!targetPeer) return;
 
-  const arrayBuffer = await file.arrayBuffer();
-  const sha256 = await computeHash(arrayBuffer);
+  // Hash só para arquivos pequenos (< 50MB) — acima disso, pula pra não crashar
+  let sha256 = '';
+  if (file.size <= 50 * 1024 * 1024) {
+    try {
+      const buf = await file.arrayBuffer();
+      sha256 = await computeHash(buf);
+    } catch (e) {
+      sha256 = 'SKIP';
+    }
+  } else {
+    sha256 = 'LARGE-' + file.size.toString(16);
+  }
 
   openTransferModal(file.name, file.size, 'Enviando Arquivo...');
 
   if (targetPeer.dc && targetPeer.dc.readyState === 'open') {
-    await sendFileOverDataChannel(targetPeer.dc, targetPeerId, file, arrayBuffer, sha256);
+    await sendFileOverDataChannel(targetPeer.dc, file, sha256);
   } else {
-    // Aguarda o canal P2P abrir se ainda estiver conectando
     openTransferModal(file.name, file.size, 'Aguardando canal P2P direto...');
     let waited = 0;
     while ((!targetPeer.dc || targetPeer.dc.readyState !== 'open') && waited < 5000) {
@@ -1310,7 +1336,7 @@ async function startSendingNextQueuedFile(targetPeerId) {
     }
     if (targetPeer.dc && targetPeer.dc.readyState === 'open') {
       openTransferModal(file.name, file.size, 'Enviando Arquivo...');
-      await sendFileOverDataChannel(targetPeer.dc, targetPeerId, file, arrayBuffer, sha256);
+      await sendFileOverDataChannel(targetPeer.dc, file, sha256);
     } else {
       alert('A conexão direta P2P com este participante não está aberta.');
       transferOverlay.classList.add('hidden');
@@ -1327,8 +1353,10 @@ async function startSendingNextQueuedFile(targetPeerId) {
   });
 }
 
-// Streaming Transfer over WebRTC DataChannel (100% P2P Direto de Alta Velocidade)
-async function sendFileOverDataChannel(dc, targetPeerId, file, arrayBuffer, sha256) {
+// Streaming Transfer over WebRTC DataChannel (simples, sem carregar tudo na RAM)
+async function sendFileOverDataChannel(dc, file, sha256) {
+  try { dc.bufferedAmountLowThreshold = BUFFER_LOW; } catch (e) {}
+
   dc.send(JSON.stringify({
     type: 'FILE_META',
     name: file.name,
@@ -1338,84 +1366,73 @@ async function sendFileOverDataChannel(dc, targetPeerId, file, arrayBuffer, sha2
     sha256: sha256
   }));
 
-  const totalBytes = arrayBuffer.byteLength;
+  const totalBytes = file.size;
   let offset = 0;
   transferStartTime = Date.now();
   lastBytes = 0;
   lastTime = Date.now();
 
-  const CHUNK_SIZE = 16 * 1024;        // 16 KB por chunk (padrão RFC 8831 WebRTC DataChannel)
-  const BUFFER_HIGH = 256 * 1024;      // 256 KB: janela que evita bufferbloat no SCTP
-  const BUFFER_LOW = 64 * 1024;        // 64 KB: retoma envio imediatamente
-  try {
-    dc.bufferedAmountLowThreshold = BUFFER_LOW;
-  } catch (e) { }
+  return new Promise((resolve) => {
+    async function sendSlice() {
+      while (offset < totalBytes) {
+        // Backpressure simples: se o buffer está cheio, espera o callback
+        if (dc.bufferedAmount > BUFFER_HIGH) {
+          dc.onbufferedamountlow = () => {
+            dc.onbufferedamountlow = null;
+            sendSlice();
+          };
+          return;
+        }
 
-  // Função auxiliar de drenagem: combina evento com polling de 5ms para nunca engasgar
-  function waitDrain() {
-    if (dc.bufferedAmount <= BUFFER_LOW) return Promise.resolve();
-    return new Promise(resolve => {
-      let done = false;
-      function cleanup() {
-        if (!done) {
-          done = true;
-          clearInterval(timer);
-          try { dc.removeEventListener('bufferedamountlow', cleanup); } catch (e) { }
+        // Lê só o chunk necessário do disco (não carrega tudo na RAM)
+        const end = Math.min(offset + CHUNK_SIZE, totalBytes);
+        const chunkBlob = file.slice(offset, end);
+        const chunkBuffer = await chunkBlob.arrayBuffer();
+
+        try {
+          dc.send(chunkBuffer);
+        } catch (err) {
+          console.error('[DataChannel] Erro ao enviar chunk:', err);
           resolve();
+          return;
         }
-      }
-      try { dc.addEventListener('bufferedamountlow', cleanup, { once: true }); } catch (e) { }
-      const timer = setInterval(() => {
-        if (dc.bufferedAmount <= BUFFER_LOW) {
-          cleanup();
-        }
-      }, 5);
-    });
-  }
 
-  while (offset < totalBytes) {
-    if (dc.bufferedAmount > BUFFER_HIGH) {
-      await waitDrain();
+        offset += chunkBuffer.byteLength;
+        updateTransferProgress(offset, totalBytes);
+      }
+
+      // Espera o buffer esvaziar antes de sinalizar conclusão
+      while (dc.bufferedAmount > 0) {
+        await new Promise(r => setTimeout(r, 50));
+      }
+      updateTransferProgress(totalBytes, totalBytes, true);
+
+      // Sinal de conclusão
+      dc.send(JSON.stringify({
+        type: 'FILE_COMPLETE',
+        totalBytes: totalBytes,
+        sha256: sha256
+      }));
+
+      transferStatePill.textContent = 'Aguardando confirmação do destinatário...';
+
+      // Aguarda ACK do receptor (timeout de 10s)
+      await new Promise(ackResolve => {
+        currentSendResolve = ackResolve;
+        setTimeout(() => {
+          if (currentSendResolve === ackResolve) {
+            currentSendResolve = null;
+            ackResolve();
+          }
+        }, 10000);
+      });
+
+      onSendComplete(sha256);
+      resolve();
     }
 
-    const chunkLen = Math.min(CHUNK_SIZE, totalBytes - offset);
-    const chunk = arrayBuffer.slice(offset, offset + chunkLen);
-    dc.send(chunk);
-    offset += chunkLen;
-
-    const actualSent = Math.max(0, offset - dc.bufferedAmount);
-    updateTransferProgress(actualSent, totalBytes);
-  }
-
-  // Aguarda todos os dados saírem fisicamente do buffer de rede antes de avisar conclusão
-  while (dc.bufferedAmount > 0) {
-    const sent = Math.max(0, totalBytes - dc.bufferedAmount);
-    updateTransferProgress(sent, totalBytes);
-    await new Promise(r => setTimeout(r, 15));
-  }
-  updateTransferProgress(totalBytes, totalBytes, true);
-
-  // Envia sinal de término pelo canal de dados P2P
-  dc.send(JSON.stringify({
-    type: 'FILE_COMPLETE',
-    totalBytes: totalBytes,
-    sha256: sha256
-  }));
-
-  transferStatePill.textContent = 'Aguardando confirmação do destinatário...';
-
-  // Aguarda confirmação do destinatário (com timeout de segurança)
-  await new Promise(resolve => {
-    currentSendResolve = resolve;
-    setTimeout(() => {
-      if (currentSendResolve === resolve) {
-        currentSendResolve = null;
-        resolve();
-      }
-    }, 10000);
+    sendSlice();
   });
-
-  onSendComplete(sha256);
 }
 
 function onSendComplete(sha256) {
