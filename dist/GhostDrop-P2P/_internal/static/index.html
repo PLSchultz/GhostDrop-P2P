@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover">
+  <title>GhostDrop — Compartilhamento e Chat Sem Rastros</title>
+  <meta name="description" content="Compartilhamento direto de arquivos e chat em grupo em tempo real, sem intermediários e sem rastros.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script src="mqtt.min.js"></script>
+  <script src="qrcode.min.js"></script>
+</head>
+<body>
+  <div class="app-background">
+    <div class="glow-orb orb-1"></div>
+    <div class="glow-orb orb-2"></div>
+    <div class="glow-orb orb-3"></div>
+    <div class="grid-overlay"></div>
+  </div>
+
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="logo-group">
+        <div class="logo-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2v8"></path>
+            <path d="m4.93 10.93 1.41 1.41"></path>
+            <path d="M2 18h2"></path>
+            <path d="M20 18h2"></path>
+            <path d="m19.07 10.93-1.41 1.41"></path>
+            <path d="M22 22H2"></path>
+            <path d="m16 6-4-4-4 4"></path>
+            <path d="M16 18a4 4 0 0 0-8 0"></path>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title">GhostDrop</div>
+          <p class="brand-subtitle">Compartilhamento direto de arquivos e mensagens</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <!-- Nickname pill in header -->
+        <div class="user-nickname-box" title="Clique para editar seu apelido">
+          <span class="nick-icon">👤</span>
+          <input type="text" id="globalNicknameInput" class="header-nick-input" placeholder="Seu apelido" maxlength="18" spellcheck="false" autocomplete="off">
+        </div>
+
+        <div class="privacy-pill" id="securityPill">
+          <span class="status-dot green" id="statusDot"></span>
+          <span class="pill-text" id="statusPillText">Pronto</span>
+        </div>
+
+        <button id="panicButton" class="btn-panic" title="Encerra o executável e destrói toda a memória da sessão">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
+          <span class="btn-panic-text"><span class="hide-on-mobile">Encerrar & </span>Limpar</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- BEFORE CONNECTION: Navigation Tabs -->
+    <div id="pairingSection">
+      <nav class="nav-tabs">
+        <button class="tab-btn active" id="tabConnectBtn" onclick="switchTab('connect')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><polyline points="10 17 15 12 10 7"></polyline><line x1="15" y1="12" x2="3" y2="12"></line></svg>
+          Entrar na Sala
+        </button>
+        <button class="tab-btn" id="tabSecurityBtn" onclick="switchTab('security')">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          Privacidade & Segurança
+        </button>
+      </nav>
+
+      <!-- Main Pairing Card -->
+      <main class="main-card">
+        
+        <!-- UNIFIED TAB: CONNECT / ENTER ANY CODE OR GENERATE -->
+        <section id="tabConnect" class="tab-content active">
+          <div class="unified-hero">
+            <div class="receive-icon-wrap">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"></circle>
+                <line x1="2" y1="12" x2="22" y2="12"></line>
+                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+              </svg>
+            </div>
+            <h2>Entrar em uma Sala</h2>
+            <p>Basta você e seus parceiros inserirem o <strong>mesmo código</strong> para sincronizarem instantaneamente no chat e troca de arquivos.</p>
+          </div>
+
+          <div class="unified-box">
+            <div class="input-group-row">
+              <label for="roomCodeInput" class="input-label">Código da Sala:</label>
+              <button type="button" id="btnGenerateRandomCode" class="btn-text-action" title="Gerar um novo código aleatório">
+                🎲 Gerar Código Aleatório
+              </button>
+            </div>
+
+            <div class="code-entry-row">
+              <input type="text" id="roomCodeInput" maxlength="7" placeholder="Ex: 849-210" autocomplete="off" spellcheck="false">
+              <button id="btnEnterRoom" class="btn-primary-large">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
+                Entrar na Sala
+              </button>
+            </div>
+
+            <div class="status-banner hidden" id="connectStatusBanner">
+              <div class="pulse-indicator"></div>
+              <span id="connectStatusText">Entrando na sala...</span>
+            </div>
+
+            <div class="quick-tips-box" style="margin-top:20px;">
+              <p>💡 <strong>Como funciona:</strong> Qualquer pessoa que digitar este mesmo código (ou acessar o link gerado) entrará diretamente na sua sala para conversar e trocar arquivos sem intermediários.</p>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 2: SECURITY -->
+        <section id="tabSecurity" class="tab-content">
+          <div class="security-grid">
+            <div class="sec-card">
+              <div class="sec-icon">🛡️</div>
+              <h3>Zero Rastros & Sem Nuvem</h3>
+              <p>Os arquivos e mensagens de chat <strong>nunca</strong> passam nem são gravados em servidores na nuvem. A transferência ocorre diretamente entre vocês.</p>
+            </div>
+
+            <div class="sec-card">
+              <div class="sec-icon">🔐</div>
+              <h3>Privacidade Total</h3>
+              <p>Seus envios e conversas são protegidos de ponta a ponta e ficam temporariamente na memória apenas durante a sessão.</p>
+            </div>
+
+            <div class="sec-card">
+              <div class="sec-icon">👥</div>
+              <h3>Salas em Grupo</h3>
+              <p>Permite 2 ou mais pessoas na mesma sala de forma descentralizada, com identificação clara de mensagens e arquivos.</p>
+            </div>
+
+            <div class="sec-card">
+              <div class="sec-icon">📦</div>
+              <h3>Sem Limite de Tamanho</h3>
+              <p>Envie arquivos pesados, fotos e documentos com velocidade máxima e sem compressão ou intermediários.</p>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+
+    <!-- AFTER CONNECTION: ACTIVE MULTI-PEER ROOM (CHAT + FILE SHARING) -->
+    <div id="activeRoomSection" class="active-room-section hidden">
+      <div class="room-top-bar">
+        <div class="room-left-info">
+          <div class="room-peer-badge">
+            <span class="status-dot green pulse"></span>
+            <span>Sala</span>
+            <span class="room-code-tag" id="activeRoomCode" title="Código da sala">#000-000</span>
+          </div>
+
+          <!-- Participants count pill -->
+          <div class="participants-pill" id="participantsPill" title="Participantes conectados">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
+            <span id="participantCountText">1 pessoa (você)</span>
+          </div>
+        </div>
+
+        <div class="room-actions">
+          <button id="btnRoomCopyCode" class="btn-action-small" title="Copiar Código da Sala">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            Copiar Código
+          </button>
+          <button id="btnRoomCopyLink" class="btn-action-small" title="Copiar Link de Convite">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+            Convidar Link
+          </button>
+          <button id="btnRoomQrCode" class="btn-action-small" title="Exibir QR Code">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+            QR Code
+          </button>
+          <button id="btnDisconnect" class="btn-disconnect" title="Sair desta sala">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"></path><line x1="12" y1="2" x2="12" y2="12"></line></svg>
+            Sair da Sala
+          </button>
+        </div>
+      </div>
+
+      <!-- QR Modal (inside room) -->
+      <div class="qr-modal-container hidden" id="qrContainer" style="margin: 8px 0;">
+        <div id="qrcode"></div>
+        <p class="qr-hint">Aponte a câmera para entrar instantaneamente nesta sala</p>
+      </div>
+
+      <!-- Connected Participants Bar -->
+      <div class="participants-list-bar" id="participantsListBar">
+        <span class="participants-label">No grupo:</span>
+        <div class="participants-chips" id="participantsChips">
+          <!-- Dynamically populated chips -->
+        </div>
+      </div>
+
+      <!-- Mobile Segmented Tabs for switching between Chat and Files on narrow screens -->
+      <div class="mobile-room-switcher" id="mobileRoomSwitcher">
+        <button type="button" class="mobile-switch-btn active" id="btnSwitchChat">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+          <span>Chat</span>
+          <span class="mobile-tab-badge hidden" id="chatUnreadDot"></span>
+        </button>
+        <button type="button" class="mobile-switch-btn" id="btnSwitchFiles">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+          <span>Arquivos</span>
+          <span class="mobile-tab-badge hidden" id="filesUnreadDot"></span>
+        </button>
+      </div>
+
+      <div class="room-main-grid" id="roomMainGrid">
+        <!-- LEFT PANEL: CHAT -->
+        <div class="chat-panel mobile-active" id="chatPanel">
+          <div class="panel-header">
+            <div class="panel-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+              <span>Chat do Grupo</span>
+            </div>
+            <span class="chat-ephemeral-hint">Mensagens temporárias</span>
+          </div>
+
+          <div class="chat-messages" id="chatMessages">
+            <div class="chat-system-msg">
+              <span>🔒 Sala iniciada. Mensagens e arquivos são transferidos diretamente entre os participantes.</span>
+            </div>
+          </div>
+
+          <div class="typing-indicator-bar hidden" id="typingIndicator">
+            <span id="typingIndicatorText">Alguém está digitando...</span>
+          </div>
+
+          <form id="chatForm" class="chat-input-row" onsubmit="return false;">
+            <input type="text" id="chatInput" placeholder="Digite uma mensagem para o grupo..." autocomplete="off">
+            <button type="submit" id="btnSendChat" class="btn-send-chat" title="Enviar Mensagem">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+            </button>
+          </form>
+        </div>
+
+        <!-- RIGHT PANEL: FILE SHARING HUB -->
+        <div class="files-panel" id="filesPanel">
+          <div class="panel-header">
+            <div class="panel-title">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+              <span>Envio de Arquivos</span>
+            </div>
+            <span class="file-size-hint">Sem limite de tamanho</span>
+          </div>
+
+          <!-- Direct Drop Zone in Room -->
+          <div class="room-drop-zone" id="roomDropZone">
+            <input type="file" id="roomFileInput" class="file-input-hidden" multiple>
+            <div class="room-drop-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="17 8 12 3 7 8"></polyline>
+                <line x1="12" y1="3" x2="12" y2="15"></line>
+              </svg>
+            </div>
+            <p class="room-drop-text">
+              <span class="hide-on-mobile">Arraste arquivos aqui ou <span class="highlight-link">clique para enviar a todos</span></span>
+              <span class="show-on-mobile">Toque aqui para <span class="highlight-link">selecionar arquivos ou fotos</span></span>
+            </p>
+          </div>
+
+          <!-- Transfers List -->
+          <div class="transfers-container">
+            <div class="transfers-title">Histórico de Arquivos da Sessão</div>
+            <div class="transfers-list" id="transfersList">
+              <div class="empty-transfers" id="emptyTransfersMsg">
+                Nenhum arquivo transferido nesta sessão. Arraste ou selecione arquivos acima para enviar ao grupo.
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LIVE TRANSFER OVERLAY MODAL -->
+    <div id="transferOverlay" class="transfer-overlay hidden">
+      <div class="transfer-modal">
+        <div class="transfer-header">
+          <h3 id="transferModalTitle">Transferindo Arquivos...</h3>
+          <span class="transfer-state-pill" id="transferStatePill">Em Andamento</span>
+        </div>
+
+        <div class="current-file-info">
+          <div class="file-name-row">
+            <span class="file-name-text" id="transferCurrentFileName">arquivo.iso</span>
+            <span class="file-percent" id="transferPercent">0%</span>
+          </div>
+          
+          <div class="progress-bar-bg">
+            <div class="progress-bar-fill" id="progressBarFill"></div>
+          </div>
+
+          <div class="transfer-stats-grid">
+            <div class="stat-item">
+              <span class="stat-label">Velocidade</span>
+              <span class="stat-value" id="transferSpeed">0.0 MB/s</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">Enviado / Total</span>
+              <span class="stat-value" id="transferBytes">0 MB / 0 MB</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">Tempo Restante</span>
+              <span class="stat-value" id="transferEta">Calculando...</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-label">Integridade SHA-256</span>
+              <span class="stat-value mono-small" id="transferHash">Calculando...</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="transfer-footer">
+          <button id="btnCancelTransfer" class="btn-cancel">Cancelar</button>
+          <a id="btnDownloadReceivedFile" class="btn-primary hidden" style="text-decoration:none;display:inline-flex;align-items:center;gap:6px;background:#10b981;" download>
+            💾 Salvar Arquivo
+          </a>
+          <button id="btnCloseTransferModal" class="btn-primary hidden">Concluir</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- INCOMING FILE CONFIRMATION MODAL -->
+    <div id="incomingModal" class="transfer-overlay hidden">
+      <div class="transfer-modal">
+        <div class="transfer-header">
+          <h3>Recebimento de Arquivo</h3>
+          <span class="transfer-state-pill" style="background:rgba(16,185,129,0.2);color:#6ee7b7;">Novo Envio</span>
+        </div>
+        <div class="incoming-header" style="margin-bottom:18px;">
+          <div class="incoming-icon">📦</div>
+          <div class="incoming-details">
+            <h4 id="incomingModalFileName" style="font-size:1.1rem;color:#f8fafc;">documento.zip</h4>
+            <p><span id="incomingModalFileSize" style="color:#fb7185;font-family:var(--font-mono);">0 MB</span> • Enviado por <strong id="incomingModalSenderName" style="color:#fca5a5;">Alguém</strong></p>
+          </div>
+        </div>
+        <div class="incoming-actions">
+          <button id="btnModalAccept" class="btn-accept" style="padding:12px;">Aceitar & Baixar</button>
+          <button id="btnModalReject" class="btn-reject" style="padding:12px;">Recusar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <span>GhostDrop • Compartilhamento Direto e Seguro</span>
+      <span class="server-info">Status: <span id="serverAddress" class="mono">Conectado</span></span>
+    </footer>
+  </div>
+
+  <script src="app.js?v=3.0.0"></script>
+</body>
+</html>
