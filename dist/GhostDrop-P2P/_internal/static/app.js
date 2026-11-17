@@ -22,9 +22,9 @@ const MQTT_BROKERS = [
 ];
 let currentBrokerIndex = 0;
 
-const CHUNK_SIZE = 64 * 1024;          // 64 KB por chunk (padrão universal WebRTC para máxima compatibilidade)
-const BUFFER_HIGH = 4 * 1024 * 1024;   // 4 MB: pausa envio se exceder
-const BUFFER_LOW = 1 * 1024 * 1024;    // 1 MB: retoma envio quando buffer drenar abaixo disto
+const CHUNK_SIZE = 16 * 1024;          // 16 KB por chunk (padrão RFC 8831 WebRTC DataChannel)
+const BUFFER_HIGH = 256 * 1024;        // 256 KB: janela ideal que evita bufferbloat no SCTP
+const BUFFER_LOW = 64 * 1024;          // 64 KB: retoma envio imediatamente
 
 // Local Identity State
 const myPeerId = 'p_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
@@ -1344,60 +1344,75 @@ async function sendFileOverDataChannel(dc, targetPeerId, file, arrayBuffer, sha2
   lastBytes = 0;
   lastTime = Date.now();
 
-  const CHUNK_SIZE = 64 * 1024;        // 64 KB por chunk (universal para WebRTC DataChannel)
-  const BUFFER_HIGH = 4 * 1024 * 1024; // 4 MB limite de pausa
-  const BUFFER_LOW = 1 * 1024 * 1024;  // 1 MB limite de retomada
-  dc.bufferedAmountLowThreshold = BUFFER_LOW;
+  const CHUNK_SIZE = 16 * 1024;        // 16 KB por chunk (padrão RFC 8831 WebRTC DataChannel)
+  const BUFFER_HIGH = 256 * 1024;      // 256 KB: janela que evita bufferbloat no SCTP
+  const BUFFER_LOW = 64 * 1024;        // 64 KB: retoma envio imediatamente
+  try {
+    dc.bufferedAmountLowThreshold = BUFFER_LOW;
+  } catch (e) { }
 
-  await new Promise((resolve) => {
-    function sendSlice() {
-      while (offset < totalBytes) {
-        if (dc.bufferedAmount > BUFFER_HIGH) {
-          dc.onbufferedamountlow = () => {
-            dc.onbufferedamountlow = null;
-            sendSlice();
-          };
-          return;
+  // Função auxiliar de drenagem: combina evento com polling de 5ms para nunca engasgar
+  function waitDrain() {
+    if (dc.bufferedAmount <= BUFFER_LOW) return Promise.resolve();
+    return new Promise(resolve => {
+      let done = false;
+      function cleanup() {
+        if (!done) {
+          done = true;
+          clearInterval(timer);
+          try { dc.removeEventListener('bufferedamountlow', cleanup); } catch (e) { }
+          resolve();
         }
-
-        const chunk = arrayBuffer.slice(offset, offset + CHUNK_SIZE);
-        dc.send(chunk);
-        offset += chunk.byteLength;
-        updateTransferProgress(offset, totalBytes);
       }
-
-      // Aguarda todos os dados saírem do buffer de rede antes de avisar conclusão
-      async function waitForDrainAndAck() {
-        while (dc.bufferedAmount > 0) {
-          const sent = Math.max(0, totalBytes - dc.bufferedAmount);
-          updateTransferProgress(sent, totalBytes);
-          await new Promise(r => setTimeout(r, 20));
+      try { dc.addEventListener('bufferedamountlow', cleanup, { once: true }); } catch (e) { }
+      const timer = setInterval(() => {
+        if (dc.bufferedAmount <= BUFFER_LOW) {
+          cleanup();
         }
-        updateTransferProgress(totalBytes, totalBytes);
+      }, 5);
+    });
+  }
 
-        // Envia sinal de término pelo canal de dados P2P
-        dc.send(JSON.stringify({
-          type: 'FILE_COMPLETE',
-          totalBytes: totalBytes,
-          sha256: sha256
-        }));
-
-        transferStatePill.textContent = 'Aguardando confirmação do destinatário...';
-
-        // Aguarda confirmação do destinatário (com timeout de segurança)
-        currentSendResolve = resolve;
-        setTimeout(() => {
-          if (currentSendResolve === resolve) {
-            currentSendResolve = null;
-            resolve();
-          }
-        }, 10000);
-      }
-
-      waitForDrainAndAck();
+  while (offset < totalBytes) {
+    if (dc.bufferedAmount > BUFFER_HIGH) {
+      await waitDrain();
     }
 
-    sendSlice();
+    const chunkLen = Math.min(CHUNK_SIZE, totalBytes - offset);
+    const chunk = arrayBuffer.slice(offset, offset + chunkLen);
+    dc.send(chunk);
+    offset += chunkLen;
+
+    const actualSent = Math.max(0, offset - dc.bufferedAmount);
+    updateTransferProgress(actualSent, totalBytes);
+  }
+
+  // Aguarda todos os dados saírem fisicamente do buffer de rede antes de avisar conclusão
+  while (dc.bufferedAmount > 0) {
+    const sent = Math.max(0, totalBytes - dc.bufferedAmount);
+    updateTransferProgress(sent, totalBytes);
+    await new Promise(r => setTimeout(r, 15));
+  }
+  updateTransferProgress(totalBytes, totalBytes, true);
+
+  // Envia sinal de término pelo canal de dados P2P
+  dc.send(JSON.stringify({
+    type: 'FILE_COMPLETE',
+    totalBytes: totalBytes,
+    sha256: sha256
+  }));
+
+  transferStatePill.textContent = 'Aguardando confirmação do destinatário...';
+
+  // Aguarda confirmação do destinatário (com timeout de segurança)
+  await new Promise(resolve => {
+    currentSendResolve = resolve;
+    setTimeout(() => {
+      if (currentSendResolve === resolve) {
+        currentSendResolve = null;
+        resolve();
+      }
+    }, 10000);
   });
 
   onSendComplete(sha256);
@@ -1467,16 +1482,20 @@ function renderTransfersList() {
   });
 }
 
-// Update UI Progress Metrics
-function updateTransferProgress(current, total) {
+// Update UI Progress Metrics (Throttled to keep main event loop free for SCTP ACKs)
+let lastUiProgressTime = 0;
+function updateTransferProgress(current, total, force = false) {
+  const now = Date.now();
+  if (!force && now - lastUiProgressTime < 80) return;
+  lastUiProgressTime = now;
+
   const percent = Math.min(100, Math.round((current / total) * 100));
   progressBarFill.style.width = percent + '%';
   transferPercent.textContent = percent + '%';
   transferBytes.textContent = `${formatBytes(current)} / ${formatBytes(total)}`;
 
-  const now = Date.now();
   const timeDelta = (now - lastTime) / 1000;
-  if (timeDelta >= 0.5) {
+  if (force || timeDelta >= 0.4) {
     const bytesDelta = current - lastBytes;
     const speedBps = bytesDelta / timeDelta;
     transferSpeed.textContent = (speedBps / (1024 * 1024)).toFixed(1) + ' MB/s';
