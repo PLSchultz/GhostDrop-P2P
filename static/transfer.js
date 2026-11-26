@@ -1,14 +1,15 @@
 /**
- * GhostDrop P2P - transfer.js
- * High-performance P2P file transfer engine:
- * - Incremental SHA-256 via Web Worker (parallel with transmission, O(1) memory)
- * - Binary chunk framing for multi-transfer multiplexing per DataChannel
- * - Adaptive chunk sizing respecting RTCPeerConnection.sctp.maxMessageSize
- * - Read-ahead I/O pipeline overlapping Blob reads with DataChannel sends
- * - Event-driven DataChannel backpressure (bufferedamountlow + safety fallback)
- * - File System Access API streaming sink with Blob fallback
- * - Per-transfer state management (zero global transfer state)
- * - Real-time instrumentation & RTCPeerConnection.getStats() diagnostics
+ * GhostDrop P2P - transfer.js (v2 - Dual-Channel Credit-Based Streaming Engine)
+ *
+ * Architecture:
+ * - Dual WebRTC DataChannels:
+ *     - 'ghostdrop-ctrl' (id: 0): JSON control, credits, ACKs, metadata, cancel
+ *     - 'ghostdrop-data' (id: 1): Binary file frames only (zero HoL blocking of control)
+ * - Receiver-driven sliding-window credit flow control (bytesAcked + windowBytes)
+ * - Dedicated Receiver Web Worker (receiver-worker.js) with zero-copy ArrayBuffer transfer,
+ *   sequence/offset validation, incremental SHA-256, and OPFS SyncAccessHandle / FS Access I/O
+ * - Sender incremental SHA-256 Web Worker (sha256-worker.js) + 2MB read-ahead pipeline
+ * - Continuous RTCPeerConnection.getStats() sampling & evidence-based bottleneck diagnostics
  */
 'use strict';
 
@@ -17,12 +18,14 @@
   const DEFAULT_MAX_CHUNK = 256 * 1024; // 256 KB upper cap
   const FALLBACK_MAX_MSG_SIZE = 64 * 1024; // 64 KB safe SCTP fallback
   const MIN_CHUNK_SIZE = 16 * 1024; // 16 KB
-  const INITIAL_CHUNK_SIZE = 64 * 1024; // 64 KB for fast first-chunk start
+  const INITIAL_CHUNK_SIZE = 64 * 1024; // 64 KB
   const READ_BLOCK_SIZE = 2 * 1024 * 1024; // 2 MB read-ahead block
 
-  const BUFFER_HIGH = 4 * 1024 * 1024; // 4 MB high-water mark
-  const BUFFER_LOW = 1 * 1024 * 1024;  // 1 MB low-water mark (bufferedAmountLowThreshold)
-  const ACK_TIMEOUT_MS = 60_000;       // 60s for receiver disk flush & hash finalization
+  const BUFFER_HIGH = 4 * 1024 * 1024; // 4 MB SCTP send buffer high-water
+  const BUFFER_LOW = 1 * 1024 * 1024;  // 1 MB SCTP send buffer low-water
+  const INITIAL_WINDOW_BYTES = 2 * 1024 * 1024; // 2 MB initial receiver credit window
+  const ACK_TIMEOUT_MS = 60_000;
+  const STATS_INTERVAL_MS = 500;
 
   const textEncoder = new TextEncoder();
   const textDecoder = new TextDecoder();
@@ -35,58 +38,45 @@
   }
 
   // =========================================================================
-  // 1. Binary Chunk Framer (Multiplexing multiple transfers per DataChannel)
+  // 1. Binary Data Frame Encoder ([1B magic][1B idLen][id][4B seq][8B offset][payload])
   // =========================================================================
-  const headerCache = new Map();
-  const idDecodeCache = new Map();
+  const idBytesCache = new Map();
 
-  function getHeaderBytes(transferId) {
-    let hdr = headerCache.get(transferId);
-    if (!hdr) {
-      const idBytes = textEncoder.encode(transferId);
-      if (idBytes.length > 255) {
-        throw new Error(`transferId too long (${idBytes.length} bytes)`);
-      }
-      hdr = new Uint8Array(2 + idBytes.length);
-      hdr[0] = FRAME_MAGIC;
-      hdr[1] = idBytes.length;
-      hdr.set(idBytes, 2);
-      headerCache.set(transferId, hdr);
+  function getEncodedId(transferId) {
+    let b = idBytesCache.get(transferId);
+    if (!b) {
+      b = textEncoder.encode(transferId);
+      if (b.length > 255) throw new Error(`transferId too long (${b.length})`);
+      idBytesCache.set(transferId, b);
     }
-    return hdr;
+    return b;
   }
 
-  function clearHeaderCache(transferId) {
-    headerCache.delete(transferId);
+  function clearEncodedId(transferId) {
+    idBytesCache.delete(transferId);
   }
 
-  function encodeChunkFrame(transferId, payloadView) {
-    const hdr = getHeaderBytes(transferId);
-    const frame = new Uint8Array(hdr.length + payloadView.byteLength);
-    frame.set(hdr, 0);
-    frame.set(payloadView, hdr.length);
+  function encodeDataFrame(transferId, seq, offset, payloadView) {
+    const idBytes = getEncodedId(transferId);
+    const headerLen = 2 + idBytes.length + 12;
+    const frame = new Uint8Array(headerLen + payloadView.byteLength);
+    frame[0] = FRAME_MAGIC;
+    frame[1] = idBytes.length;
+    frame.set(idBytes, 2);
+
+    const dv = new DataView(frame.buffer, 2 + idBytes.length, 12);
+    dv.setUint32(0, seq >>> 0, false);
+    const offHigh = Math.floor(offset / 0x100000000);
+    const offLow = offset >>> 0;
+    dv.setUint32(4, offHigh >>> 0, false);
+    dv.setUint32(8, offLow, false);
+
+    frame.set(payloadView, headerLen);
     return frame.buffer;
   }
 
-  function decodeChunkFrame(arrayBuffer) {
-    const view = new Uint8Array(arrayBuffer);
-    if (view.byteLength < 3 || view[0] !== FRAME_MAGIC) {
-      return null;
-    }
-    const idLen = view[1];
-    const headerLen = 2 + idLen;
-    if (view.byteLength < headerLen) {
-      return null;
-    }
-    const idSlice = view.subarray(2, headerLen);
-    // Fast cache lookup by string key only if needed; TextDecoder is fast for ~25 bytes
-    const transferId = textDecoder.decode(idSlice);
-    const payloadView = view.subarray(headerLen);
-    return { transferId, payloadView };
-  }
-
   // =========================================================================
-  // 2. Incremental SHA-256 Worker Client
+  // 2. Sender Incremental SHA-256 Worker Client
   // =========================================================================
   class Sha256WorkerClient {
     constructor(workerPath = 'sha256-worker.js') {
@@ -124,7 +114,6 @@
           console.warn('[Sha256WorkerClient] Worker error:', err);
         };
       } catch (e) {
-        console.warn('[Sha256WorkerClient] Failed to spawn Worker, using fallback:', e);
         this.worker = null;
         this.fallbackJobs = new Map();
       }
@@ -148,12 +137,8 @@
             this.worker.postMessage({ type: 'update', jobId, buffer: copy }, [copy]);
           }
         } else if (ArrayBuffer.isView(data)) {
-          if (transferBuffer && data.byteOffset === 0 && data.byteLength === data.buffer.byteLength) {
-            this.worker.postMessage({ type: 'update', jobId, buffer: data.buffer }, [data.buffer]);
-          } else {
-            const copy = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-            this.worker.postMessage({ type: 'update', jobId, buffer: copy }, [copy]);
-          }
+          const copy = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+          this.worker.postMessage({ type: 'update', jobId, buffer: copy }, [copy]);
         }
       } else if (this.fallbackJobs) {
         const hasher = this.fallbackJobs.get(jobId);
@@ -199,7 +184,90 @@
   }
 
   // =========================================================================
-  // 3. Per-DataChannel Backpressure Coordinator
+  // 3. Dedicated Receiver Worker Client (with Node/Fallback support)
+  // =========================================================================
+  class ReceiverWorkerClient {
+    constructor(workerPath = 'receiver-worker.js', handlers = {}) {
+      this.workerPath = workerPath;
+      this.handlers = handlers;
+      this.worker = null;
+      this.fallbackManager = null;
+      this._init();
+    }
+
+    _init() {
+      if (typeof Worker !== 'undefined') {
+        try {
+          this.worker = new Worker(this.workerPath);
+          this.worker.onmessage = (event) => this._dispatch(event.data);
+          this.worker.onerror = (err) => console.error('[ReceiverWorkerClient] Worker error:', err);
+          return;
+        } catch (e) {
+          console.warn('[ReceiverWorkerClient] Worker spawn failed, using fallback:', e);
+        }
+      }
+      if (globalScope.ReceiverJobManager && globalScope.Sha256Incremental) {
+        this.fallbackManager = new globalScope.ReceiverJobManager(
+          (msg) => this._dispatch(msg),
+          globalScope.Sha256Incremental
+        );
+      }
+    }
+
+    _dispatch(msg) {
+      if (!msg || !msg.type) return;
+      if (msg.type === 'ready' && this.handlers.onReady) this.handlers.onReady(msg);
+      else if (msg.type === 'init_error' && this.handlers.onInitError) this.handlers.onInitError(msg);
+      else if (msg.type === 'credit' && this.handlers.onCredit) this.handlers.onCredit(msg);
+      else if (msg.type === 'finalized' && this.handlers.onFinalized) this.handlers.onFinalized(msg);
+      else if (msg.type === 'error' && this.handlers.onError) this.handlers.onError(msg);
+    }
+
+    initJob(payload) {
+      if (this.worker) {
+        this.worker.postMessage({ type: 'init', ...payload });
+      } else if (this.fallbackManager) {
+        this.fallbackManager.initJob(payload);
+      }
+    }
+
+    pushChunk(arrayBuffer) {
+      if (this.worker) {
+        // Zero-copy transfer of ownership to Receiver Worker
+        this.worker.postMessage({ type: 'chunk', buffer: arrayBuffer }, [arrayBuffer]);
+      } else if (this.fallbackManager) {
+        this.fallbackManager.handleChunk(arrayBuffer);
+      }
+    }
+
+    finalizeJob(payload) {
+      if (this.worker) {
+        this.worker.postMessage({ type: 'finalize', ...payload });
+      } else if (this.fallbackManager) {
+        this.fallbackManager.finalizeJob(payload);
+      }
+    }
+
+    abortJob(transferId) {
+      if (this.worker) {
+        this.worker.postMessage({ type: 'abort', transferId });
+      } else if (this.fallbackManager) {
+        this.fallbackManager.abortJob(transferId);
+      }
+    }
+
+    removeOpfsTemp(tempFileName) {
+      if (!tempFileName) return;
+      if (this.worker) {
+        this.worker.postMessage({ type: 'remove_opfs_temp', tempFileName });
+      } else if (this.fallbackManager) {
+        this.fallbackManager.removeOpfsTemp(tempFileName);
+      }
+    }
+  }
+
+  // =========================================================================
+  // 4. Per-DataChannel Backpressure Coordinator
   // =========================================================================
   const channelCoordinators = new WeakMap();
 
@@ -259,7 +327,6 @@
       }
 
       try {
-        // Ensure threshold triggers bufferedamountlow when draining
         const targetThreshold = Math.min(threshold, BUFFER_LOW);
         if (this.dc.bufferedAmountLowThreshold !== targetThreshold) {
           this.dc.bufferedAmountLowThreshold = targetThreshold;
@@ -292,7 +359,6 @@
           abortSignal.addEventListener('abort', onAbort, { once: true });
         }
 
-        // Safety net in case browser misses bufferedamountlow event
         safetyTimer = setInterval(() => {
           if (!this.waiters.has(waiter)) {
             cleanup();
@@ -311,7 +377,6 @@
           }
         }, 120);
 
-        // Re-check immediately to avoid race between check and registration
         if (this.dc.bufferedAmount <= threshold) {
           this.waiters.delete(waiter);
           cleanup();
@@ -322,91 +387,7 @@
   }
 
   // =========================================================================
-  // 4. Receiver Storage Sinks (File System Access API + Blob Fallback)
-  // =========================================================================
-  class FileSystemFileSink {
-    constructor(fileHandle, writable) {
-      this.kind = 'fs-access';
-      this.fileHandle = fileHandle;
-      this.writable = writable;
-      this.writeChain = Promise.resolve();
-      this.closed = false;
-    }
-
-    write(uint8Array) {
-      // Copy slice into independent buffer because underlying frame buffer may be reused/GC'd
-      const copy = new Uint8Array(uint8Array.byteLength);
-      copy.set(uint8Array);
-      this.writeChain = this.writeChain.then(() => {
-        if (!this.closed) {
-          return this.writable.write(copy);
-        }
-      });
-      return this.writeChain;
-    }
-
-    async close() {
-      await this.writeChain;
-      if (!this.closed) {
-        this.closed = true;
-        await this.writable.close();
-      }
-      return { blob: null, blobUrl: null, savedToDisk: true };
-    }
-
-    async abort() {
-      this.closed = true;
-      try {
-        await this.writable.abort();
-      } catch (e) { }
-    }
-  }
-
-  class BlobFileSink {
-    constructor(mimeType) {
-      this.kind = 'blob';
-      this.mimeType = mimeType || 'application/octet-stream';
-      this.chunks = [];
-    }
-
-    write(uint8Array) {
-      // Copy payload bytes out of the framed ArrayBuffer so header bytes aren't retained
-      const copy = new Uint8Array(uint8Array.byteLength);
-      copy.set(uint8Array);
-      this.chunks.push(copy);
-      return Promise.resolve();
-    }
-
-    async close() {
-      const blob = new Blob(this.chunks, { type: this.mimeType });
-      this.chunks = [];
-      return { blob, blobUrl: null, savedToDisk: false };
-    }
-
-    async abort() {
-      this.chunks = [];
-    }
-  }
-
-  async function createReceiverSink(fileName, mimeType) {
-    if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function' && window.isSecureContext) {
-      try {
-        const handle = await window.showSaveFilePicker({ suggestedName: fileName });
-        const writable = await handle.createWritable();
-        return { sink: new FileSystemFileSink(handle, writable), userCancelled: false };
-      } catch (err) {
-        if (err && err.name === 'AbortError') {
-          return { sink: null, userCancelled: true };
-        }
-        // SecurityError / NotAllowedError / other -> fallback silently to Blob sink
-        console.warn('[ReceiverSink] File System Access fallback to Blob:', err.message || err);
-      }
-    }
-    return { sink: new BlobFileSink(mimeType), userCancelled: false };
-  }
-
-  // =========================================================================
-  // 5. WebRTC Stats & Bottleneck Diagnostics
+  // 5. WebRTC Stats & Evidence-Based Bottleneck Diagnostics
   // =========================================================================
   async function collectRtcStats(pc) {
     if (!pc || typeof pc.getStats !== 'function') return null;
@@ -415,21 +396,25 @@
       let selectedPair = null;
       const localCandidates = new Map();
       const remoteCandidates = new Map();
-      let transportSelectedId = null;
+      let transportStat = null;
+      let dcStat = null;
 
       report.forEach((stat) => {
-        if (stat.type === 'transport' && stat.selectedCandidatePairId) {
-          transportSelectedId = stat.selectedCandidatePairId;
+        if (stat.type === 'transport') {
+          transportStat = stat;
         } else if (stat.type === 'local-candidate') {
           localCandidates.set(stat.id, stat);
         } else if (stat.type === 'remote-candidate') {
           remoteCandidates.set(stat.id, stat);
+        } else if (stat.type === 'data-channel') {
+          dcStat = stat;
         }
       });
 
+      const selectedId = transportStat ? transportStat.selectedCandidatePairId : null;
       report.forEach((stat) => {
         if (stat.type === 'candidate-pair') {
-          if (stat.id === transportSelectedId || (stat.state === 'succeeded' && stat.nominated)) {
+          if (stat.id === selectedId || (stat.state === 'succeeded' && stat.nominated)) {
             selectedPair = stat;
           }
         }
@@ -449,40 +434,62 @@
         localCandidateType: local ? local.candidateType : 'unknown',
         remoteCandidateType: remote ? remote.candidateType : 'unknown',
         protocol: local ? local.protocol : 'unknown',
+        directP2P: !isRelay,
         usingTurnRelay: Boolean(isRelay),
-        bytesSent: selectedPair.bytesSent || 0,
-        bytesReceived: selectedPair.bytesReceived || 0
+        transportBytesSent: transportStat ? (transportStat.bytesSent || 0) : (selectedPair.bytesSent || 0),
+        transportBytesReceived: transportStat ? (transportStat.bytesReceived || 0) : (selectedPair.bytesReceived || 0),
+        dcBytesSent: dcStat ? (dcStat.bytesSent || 0) : 0,
+        dcBytesReceived: dcStat ? (dcStat.bytesReceived || 0) : 0
       };
     } catch (e) {
       return null;
     }
   }
 
-  function classifyBottleneck(metrics, rtcStats) {
-    if (!metrics) return 'unknown';
-    const totalMs = metrics.totalDurationMs || 1;
-    const bpRatio = (metrics.backpressureWaitMs || 0) / totalMs;
-
-    if (rtcStats && rtcStats.usingTurnRelay && bpRatio > 0.25) {
-      return 'network_turn_relay';
+  function diagnoseBottleneck(state, rtcStats) {
+    const m = state.metrics;
+    if (rtcStats && rtcStats.usingTurnRelay) {
+      return 'turn_relay_detected';
     }
-    if (bpRatio > 0.35 || (rtcStats && rtcStats.rttMs !== null && rtcStats.rttMs > 80 && bpRatio > 0.15)) {
-      return 'network_congestion_or_rtt';
+    if (state.direction === 'send') {
+      const creditWait = m.creditWaitMs || 0;
+      const bpWait = m.backpressureWaitMs || 0;
+      const recv = m.receiverMetrics;
+      if (creditWait > bpWait && creditWait > 50) {
+        if (recv && recv.storageTimeMs > recv.hashTimeMs * 1.5) {
+          return 'receiver_storage_io';
+        }
+        if (recv && recv.hashTimeMs > (recv.storageTimeMs || 1) * 1.5) {
+          return 'receiver_cpu_hash';
+        }
+        return 'waiting_receiver_credits';
+      }
+      if (bpWait > 50) {
+        if (rtcStats && rtcStats.rttMs !== null && rtcStats.rttMs > 80) {
+          return 'network_high_rtt';
+        }
+        return 'waiting_local_sctp_buffer';
+      }
+      return 'direct_p2p_optimal';
+    } else {
+      const storageMs = m.storageDurationMs || 0;
+      const hashMs = m.sha256DurationMs || 0;
+      const totalMs = m.totalDurationMs || 1;
+      if (storageMs > hashMs * 1.5 && storageMs > totalMs * 0.25) {
+        return 'receiver_storage_io';
+      }
+      if (hashMs > storageMs * 1.5 && hashMs > totalMs * 0.25) {
+        return 'receiver_cpu_hash';
+      }
+      if (rtcStats && rtcStats.rttMs !== null && rtcStats.rttMs > 80) {
+        return 'network_high_rtt';
+      }
+      return 'direct_p2p_optimal';
     }
-    if ((metrics.sha256DurationMs || 0) > totalMs * 0.8 && bpRatio < 0.1) {
-      return 'local_cpu_sha256';
-    }
-    if (bpRatio < 0.05 && (metrics.peakBufferedAmount || 0) < BUFFER_LOW) {
-      return 'local_io_or_cpu';
-    }
-    return 'balanced_p2p';
   }
 
-  // =========================================================================
-  // 6. Adaptive Chunk Sizing Helper
-  // =========================================================================
   function resolveMaxPayloadSize(pc, transferId) {
-    const hdrLen = getHeaderBytes(transferId).length;
+    const hdrLen = 2 + getEncodedId(transferId).length + 12;
     let sctpMax = FALLBACK_MAX_MSG_SIZE;
     if (pc && pc.sctp && typeof pc.sctp.maxMessageSize === 'number' && pc.sctp.maxMessageSize > 0) {
       sctpMax = pc.sctp.maxMessageSize;
@@ -491,8 +498,23 @@
     return Math.max(MIN_CHUNK_SIZE - hdrLen, capped - hdrLen);
   }
 
+  async function pickSaveFileHandleIfAvailable(fileName) {
+    if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function' && window.isSecureContext) {
+      try {
+        const handle = await window.showSaveFilePicker({ suggestedName: fileName });
+        return { fileHandle: handle, userCancelled: false };
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          return { fileHandle: null, userCancelled: true };
+        }
+        console.warn('[GhostDropTransfer] showSaveFilePicker unavailable, using OPFS/fallback:', err.message || err);
+      }
+    }
+    return { fileHandle: null, userCancelled: false };
+  }
+
   // =========================================================================
-  // 7. TransferManager (Per-Transfer State, Send & Receive Pipelines)
+  // 6. TransferManager (Dual-Channel, Credit-Controlled, Instrumented)
   // =========================================================================
   class TransferManager {
     constructor(options) {
@@ -500,9 +522,17 @@
       this.getPeer = options.getPeer;
       this.sendPeerMessage = options.sendPeerMessage;
       this.callbacks = options.callbacks || {};
-      this.hashClient = new Sha256WorkerClient(options.workerPath || 'sha256-worker.js');
 
-      this.transfers = new Map(); // transferId -> transferState
+      this.hashClient = new Sha256WorkerClient(options.sha256WorkerPath || options.workerPath || 'sha256-worker.js');
+      this.receiverWorker = new ReceiverWorkerClient(options.receiverWorkerPath || 'receiver-worker.js', {
+        onReady: (msg) => this._onReceiverReady(msg),
+        onInitError: (msg) => this._onReceiverInitError(msg),
+        onCredit: (msg) => this._onReceiverCredit(msg),
+        onFinalized: (msg) => this._onReceiverFinalized(msg),
+        onError: (msg) => this._onReceiverError(msg)
+      });
+
+      this.transfers = new Map();
       this.completedMetrics = [];
     }
 
@@ -512,7 +542,7 @@
 
     getActiveTransfers() {
       return Array.from(this.transfers.values()).filter(
-        t => t.status === 'offered' || t.status === 'accepted' || t.status === 'transferring' || t.status === 'validating'
+        t => ['offered', 'initializing', 'accepted', 'transferring', 'validating'].includes(t.status)
       );
     }
 
@@ -533,12 +563,24 @@
         size: file.size,
         mimeType: file.type || 'application/octet-stream',
         status: 'offered',
-        bytesTransferred: 0,
+
+        // Honest byte accounting
+        bytesSentTransport: 0,
+        bytesAcked: 0,
+        bytesTransferred: 0, // alias for UI compatibility (= bytesAcked on send)
+        windowBytes: INITIAL_WINDOW_BYTES,
+        creditLimitOffset: INITIAL_WINDOW_BYTES,
+        inFlightBytes: 0,
         chunksCount: 0,
         sha256: null,
         abortController,
+
+        creditWaiter: null,
         ackResolver: null,
         ackRejecter: null,
+        statsTimer: null,
+        waitStateLabel: null,
+
         metrics: {
           transferId,
           direction: 'send',
@@ -550,18 +592,25 @@
           completedAt: null,
           acceptToFirstByteMs: null,
           totalDurationMs: null,
+          sendSpeedMBps: 0,
+          ackedSpeedMBps: 0,
           avgThroughputMBps: 0,
           instantThroughputMBps: 0,
           chunksCount: 0,
           avgChunkSizeBytes: 0,
           peakBufferedAmount: 0,
+          peakInFlightBytes: 0,
           backpressureWaitMs: 0,
+          creditWaitMs: 0,
           sha256DurationMs: 0,
-          validationDurationMs: null,
+          receiverMetrics: null,
           rtcStats: null,
+          statsSamples: [],
           bottleneck: 'unknown',
-          lastSampleTime: 0,
-          lastSampleBytes: 0
+          lastAckSampleTime: 0,
+          lastAckSampleBytes: 0,
+          lastSendSampleTime: 0,
+          lastSendSampleBytes: 0
         }
       };
 
@@ -569,7 +618,7 @@
       return state;
     }
 
-    registerReceiveTransfer(offer, sink) {
+    async prepareReceiveTransfer(offer, fileHandle = null) {
       const abortController = new AbortController();
       const state = {
         transferId: offer.transferId,
@@ -580,15 +629,25 @@
         name: offer.name,
         size: offer.size,
         mimeType: offer.mimeType || 'application/octet-stream',
-        status: 'accepted',
-        bytesTransferred: 0,
+        status: 'initializing',
+
+        bytesReceived: 0,
+        bytesProcessed: 0,
+        bytesWritten: 0,
+        bytesTransferred: 0, // = bytesWritten
         chunksCount: 0,
+        windowBytes: INITIAL_WINDOW_BYTES,
+        storageBackend: 'pending',
         sha256: null,
         expectedSha256: null,
         pendingCompleteMsg: null,
         finalizing: false,
-        sink,
         abortController,
+        readyResolve: null,
+        readyReject: null,
+        statsTimer: null,
+        opfsTempName: null,
+
         metrics: {
           transferId: offer.transferId,
           direction: 'receive',
@@ -601,13 +660,15 @@
           totalDurationMs: null,
           avgThroughputMBps: 0,
           instantThroughputMBps: 0,
+          writeSpeedMBps: 0,
           chunksCount: 0,
           avgChunkSizeBytes: 0,
-          peakBufferedAmount: 0,
-          backpressureWaitMs: 0,
           sha256DurationMs: 0,
+          storageDurationMs: 0,
           validationDurationMs: 0,
+          storageBackend: 'pending',
           rtcStats: null,
+          statsSamples: [],
           bottleneck: 'unknown',
           lastSampleTime: performance.now(),
           lastSampleBytes: 0
@@ -615,21 +676,252 @@
       };
 
       this.transfers.set(offer.transferId, state);
-      this.hashClient.init(offer.transferId);
-      return state;
+
+      const readyPromise = new Promise((resolve, reject) => {
+        state.readyResolve = resolve;
+        state.readyReject = reject;
+      });
+
+      this.receiverWorker.initJob({
+        transferId: offer.transferId,
+        name: offer.name,
+        size: offer.size,
+        mimeType: state.mimeType,
+        fileHandle,
+        initialWindowBytes: INITIAL_WINDOW_BYTES
+      });
+
+      return readyPromise;
+    }
+
+    _onReceiverReady(msg) {
+      const state = this.transfers.get(msg.transferId);
+      if (!state) return;
+      state.status = 'accepted';
+      state.storageBackend = msg.backend;
+      state.windowBytes = msg.windowBytes;
+      state.metrics.storageBackend = msg.backend;
+      if (state.readyResolve) {
+        state.readyResolve(state);
+        state.readyResolve = null;
+        state.readyReject = null;
+      }
+    }
+
+    _onReceiverInitError(msg) {
+      const state = this.transfers.get(msg.transferId);
+      if (!state) return;
+      state.status = 'failed';
+      const err = new Error(msg.error || 'Falha ao inicializar armazenamento');
+      if (state.readyReject) {
+        state.readyReject(err);
+        state.readyResolve = null;
+        state.readyReject = null;
+      }
+      this.transfers.delete(msg.transferId);
+    }
+
+    _onReceiverCredit(msg) {
+      const state = this.transfers.get(msg.transferId);
+      if (!state || state.status === 'cancelled' || state.status === 'failed') return;
+
+      const m = msg.metrics || {};
+      state.bytesReceived = m.bytesReceived || state.bytesReceived;
+      state.bytesProcessed = m.bytesProcessed || state.bytesProcessed;
+      state.bytesWritten = m.bytesWritten || state.bytesWritten;
+      state.bytesTransferred = state.bytesWritten;
+      state.windowBytes = msg.windowBytes || state.windowBytes;
+
+      state.metrics.sha256DurationMs = m.hashTimeMs || 0;
+      state.metrics.storageDurationMs = m.storageTimeMs || 0;
+      state.metrics.writeSpeedMBps = (m.writeSpeedBps || 0) / (1024 * 1024);
+
+      const now = performance.now();
+      const dt = (now - state.metrics.lastSampleTime) / 1000;
+      if (dt >= 0.25) {
+        state.metrics.instantThroughputMBps = ((state.bytesWritten - state.metrics.lastSampleBytes) / (1024 * 1024)) / dt;
+        state.metrics.lastSampleTime = now;
+        state.metrics.lastSampleBytes = state.bytesWritten;
+      }
+
+      // Send credit update over independent control channel
+      this.sendPeerMessage(state.peerId, {
+        type: 'TRANSFER_CREDIT',
+        transferId: state.transferId,
+        ackedOffset: msg.ackedOffset,
+        ackedSeq: msg.ackedSeq,
+        windowBytes: msg.windowBytes,
+        metrics: m
+      });
+
+      if (this.callbacks.onTransferProgress) {
+        this.callbacks.onTransferProgress(state, false);
+      }
+
+      if (state.pendingCompleteMsg && state.bytesWritten >= state.size && !state.finalizing) {
+        const comp = state.pendingCompleteMsg;
+        state.pendingCompleteMsg = null;
+        this._triggerReceiverFinalize(state, comp);
+      }
+    }
+
+    _onReceiverError(msg) {
+      const state = this.transfers.get(msg.transferId);
+      if (!state) return;
+      this._stopStatsSampling(state);
+      state.status = 'failed';
+      this.sendPeerMessage(state.peerId, {
+        type: 'FILE_COMPLETE_ACK',
+        transferId: state.transferId,
+        ok: false,
+        reason: msg.error || 'receiver_worker_error'
+      });
+      if (this.callbacks.onTransferError) {
+        this.callbacks.onTransferError(state, new Error(msg.error || 'Erro no receptor'));
+      }
+    }
+
+    async _onReceiverFinalized(msg) {
+      const state = this.transfers.get(msg.transferId);
+      if (!state) return;
+      this._stopStatsSampling(state);
+
+      const m = msg.metrics || {};
+      state.bytesReceived = m.bytesReceived ?? state.bytesReceived;
+      state.bytesProcessed = m.bytesProcessed ?? state.bytesProcessed;
+      state.bytesWritten = m.bytesWritten ?? state.bytesWritten;
+      state.bytesTransferred = state.bytesWritten;
+      state.metrics.sha256DurationMs = m.hashTimeMs || state.metrics.sha256DurationMs;
+      state.metrics.storageDurationMs = m.storageTimeMs || state.metrics.storageDurationMs;
+      state.metrics.validationDurationMs = performance.now() - (state.validationStartTime || performance.now());
+      state.opfsTempName = msg.opfsTempName || null;
+
+      if (!msg.ok) {
+        state.status = 'failed';
+        this.sendPeerMessage(state.peerId, {
+          type: 'FILE_COMPLETE_ACK',
+          transferId: state.transferId,
+          ok: false,
+          sha256: msg.sha256 || '',
+          reason: msg.reason || 'validation_failed'
+        });
+        if (this.callbacks.onTransferError) {
+          this.callbacks.onTransferError(state, new Error(`Falha na validação: ${msg.reason}`));
+        }
+        return;
+      }
+
+      state.sha256 = msg.sha256;
+      state.status = 'completed';
+      state.metrics.completedAt = performance.now();
+      state.metrics.totalDurationMs = state.metrics.completedAt - state.metrics.acceptedAt;
+      state.metrics.chunksCount = state.chunksCount;
+      state.metrics.avgChunkSizeBytes = state.chunksCount > 0 ? Math.round(state.bytesWritten / state.chunksCount) : 0;
+      const secs = Math.max(0.001, state.metrics.totalDurationMs / 1000);
+      state.metrics.avgThroughputMBps = (state.bytesWritten / (1024 * 1024)) / secs;
+
+      const peer = this.getPeer(state.peerId);
+      state.metrics.rtcStats = peer ? await collectRtcStats(peer.pc) : null;
+      state.metrics.bottleneck = diagnoseBottleneck(state, state.metrics.rtcStats);
+
+      // Confirm completion ONLY after size, sequence, disk write, and SHA-256 pass
+      this.sendPeerMessage(state.peerId, {
+        type: 'FILE_COMPLETE_ACK',
+        transferId: state.transferId,
+        ok: true,
+        sha256: state.sha256
+      });
+
+      this.completedMetrics.push(state.metrics);
+      console.info('[GhostDrop Metrics - Receive]', state.metrics);
+
+      if (this.callbacks.onTransferComplete) {
+        this.callbacks.onTransferComplete(state, {
+          file: msg.file || null,
+          blob: msg.blob || null,
+          savedToDisk: Boolean(msg.savedToDisk),
+          opfsTempName: msg.opfsTempName || null,
+          cleanupOpfs: () => {
+            if (msg.opfsTempName) this.receiverWorker.removeOpfsTemp(msg.opfsTempName);
+          }
+        });
+      }
+    }
+
+    // =======================================================================
+    // Sender Flow Control & Pipeline
+    // =======================================================================
+    handleTransferCredit(fromPeerId, msg) {
+      const state = this.transfers.get(msg.transferId);
+      if (!state || state.direction !== 'send' || state.peerId !== fromPeerId) return;
+
+      const prevAcked = state.bytesAcked;
+      if (typeof msg.ackedOffset === 'number' && msg.ackedOffset > state.bytesAcked) {
+        state.bytesAcked = msg.ackedOffset;
+        state.bytesTransferred = state.bytesAcked;
+      }
+      if (typeof msg.windowBytes === 'number' && msg.windowBytes > 0) {
+        state.windowBytes = msg.windowBytes;
+      }
+      state.creditLimitOffset = state.bytesAcked + state.windowBytes;
+      state.inFlightBytes = Math.max(0, state.bytesSentTransport - state.bytesAcked);
+      state.metrics.receiverMetrics = msg.metrics || state.metrics.receiverMetrics;
+
+      const now = performance.now();
+      const dt = (now - state.metrics.lastAckSampleTime) / 1000;
+      if (dt >= 0.25 && state.bytesAcked > prevAcked) {
+        state.metrics.ackedSpeedMBps = ((state.bytesAcked - state.metrics.lastAckSampleBytes) / (1024 * 1024)) / dt;
+        state.metrics.instantThroughputMBps = state.metrics.ackedSpeedMBps;
+        state.metrics.lastAckSampleTime = now;
+        state.metrics.lastAckSampleBytes = state.bytesAcked;
+      }
+
+      if (state.creditWaiter) {
+        state.creditWaiter();
+      }
+      if (this.callbacks.onTransferProgress) {
+        this.callbacks.onTransferProgress(state, false);
+      }
+    }
+
+    _waitForCredits(state, neededOffset, signal) {
+      if (neededOffset <= state.creditLimitOffset) return Promise.resolve();
+      if (signal.aborted) return Promise.reject(new Error('Transfer cancelled'));
+
+      return new Promise((resolve, reject) => {
+        const check = () => {
+          if (signal.aborted) {
+            state.creditWaiter = null;
+            signal.removeEventListener('abort', onAbort);
+            reject(new Error('Transfer cancelled'));
+            return;
+          }
+          if (neededOffset <= state.creditLimitOffset) {
+            state.creditWaiter = null;
+            signal.removeEventListener('abort', onAbort);
+            resolve();
+          }
+        };
+        const onAbort = () => check();
+        signal.addEventListener('abort', onAbort, { once: true });
+        state.creditWaiter = check;
+      });
     }
 
     async handleOfferAccepted(fromPeerId, msg) {
       const state = this.transfers.get(msg.transferId);
-      if (!state || state.direction !== 'send' || state.peerId !== fromPeerId) {
-        return;
-      }
+      if (!state || state.direction !== 'send' || state.peerId !== fromPeerId) return;
       if (state.status !== 'offered') return;
+
+      if (typeof msg.windowBytes === 'number' && msg.windowBytes > 0) {
+        state.windowBytes = msg.windowBytes;
+        state.creditLimitOffset = msg.windowBytes;
+      }
 
       state.status = 'transferring';
       state.metrics.acceptedAt = performance.now();
-      state.metrics.lastSampleTime = state.metrics.acceptedAt;
-      state.metrics.lastSampleBytes = 0;
+      state.metrics.lastAckSampleTime = state.metrics.acceptedAt;
+      state.metrics.lastSendSampleTime = state.metrics.acceptedAt;
 
       if (this.callbacks.onTransferStart) {
         this.callbacks.onTransferStart(state);
@@ -645,7 +937,8 @@
           }
         }
       } finally {
-        clearHeaderCache(state.transferId);
+        this._stopStatsSampling(state);
+        clearEncodedId(state.transferId);
       }
     }
 
@@ -661,20 +954,20 @@
 
     async _executeSendPipeline(state) {
       const peer = this.getPeer(state.peerId);
-      if (!peer || !peer.dc || peer.dc.readyState !== 'open') {
-        throw new Error('DataChannel não está aberto para envio');
+      const dcData = peer ? (peer.dcData || peer.dc) : null;
+      const pc = peer ? peer.pc : null;
+      if (!peer || !dcData || dcData.readyState !== 'open') {
+        throw new Error('Canal de dados P2P não está aberto');
       }
 
-      const dc = peer.dc;
-      const pc = peer.pc;
       const signal = state.abortController.signal;
-      const backpressure = DataChannelBackpressure.forChannel(dc);
+      const backpressure = DataChannelBackpressure.forChannel(dcData);
       const maxPayload = resolveMaxPayloadSize(pc, state.transferId);
 
-      // Start incremental SHA-256 job in parallel
+      this._startStatsSampling(state, pc, dcData);
       this.hashClient.init(state.transferId);
 
-      // Send FILE_META immediately (hash will follow in FILE_COMPLETE)
+      // Send FILE_META on control channel
       this.sendPeerMessage(state.peerId, {
         type: 'FILE_META',
         transferId: state.transferId,
@@ -690,27 +983,22 @@
       const file = state.file;
       const totalBytes = file.size;
       let offset = 0;
+      let seq = 0;
       let chunkSize = totalBytes < 512 * 1024
         ? Math.min(maxPayload, 32 * 1024)
         : Math.min(maxPayload, INITIAL_CHUNK_SIZE);
 
-      // Read-ahead pipeline: kick off first 2 MB block read
       let nextReadOffset = Math.min(READ_BLOCK_SIZE, totalBytes);
       let currentBlockPromise = totalBytes > 0
         ? file.slice(0, nextReadOffset).arrayBuffer()
         : Promise.resolve(new ArrayBuffer(0));
 
       while (offset < totalBytes) {
-        if (signal.aborted) {
-          throw new Error('Transfer cancelled');
-        }
+        if (signal.aborted) throw new Error('Transfer cancelled');
 
         const blockBuffer = await currentBlockPromise;
-        if (signal.aborted) {
-          throw new Error('Transfer cancelled');
-        }
+        if (signal.aborted) throw new Error('Transfer cancelled');
 
-        // Kick off next read-ahead block while we send the current block
         if (nextReadOffset < totalBytes) {
           const nextEnd = Math.min(nextReadOffset + READ_BLOCK_SIZE, totalBytes);
           currentBlockPromise = file.slice(nextReadOffset, nextEnd).arrayBuffer();
@@ -719,93 +1007,108 @@
           currentBlockPromise = null;
         }
 
-        // Send entire 2 MB block to SHA-256 worker in parallel!
-        // Note: copy is only needed if we slice chunks from blockBuffer;
-        // we copy-transfer to worker after reading so main thread keeps blockBuffer for dc.send.
+        // Incremental SHA-256 in parallel
         this.hashClient.update(state.transferId, blockBuffer, false);
 
         const blockView = new Uint8Array(blockBuffer);
         let blockPos = 0;
 
         while (blockPos < blockView.byteLength) {
-          if (signal.aborted) {
-            throw new Error('Transfer cancelled');
-          }
-
-          if (dc.bufferedAmount > BUFFER_HIGH) {
-            const waitStart = performance.now();
-            await backpressure.waitUntilBelow(BUFFER_LOW, signal);
-            state.metrics.backpressureWaitMs += performance.now() - waitStart;
-          }
+          if (signal.aborted) throw new Error('Transfer cancelled');
 
           const endPos = Math.min(blockPos + chunkSize, blockView.byteLength);
-          const payloadSlice = blockView.subarray(blockPos, endPos);
-          const frameBuffer = encodeChunkFrame(state.transferId, payloadSlice);
+          const payloadLen = endPos - blockPos;
 
-          dc.send(frameBuffer);
+          // 1. Receiver-credit sliding window enforcement
+          if (offset + payloadLen > state.creditLimitOffset) {
+            state.waitStateLabel = 'Aguardando créditos do receptor...';
+            const tCred = performance.now();
+            await this._waitForCredits(state, offset + payloadLen, signal);
+            state.metrics.creditWaitMs += performance.now() - tCred;
+            state.waitStateLabel = null;
+          }
+
+          // 2. Local SCTP DataChannel backpressure
+          if (dcData.bufferedAmount > BUFFER_HIGH) {
+            state.waitStateLabel = 'Aguardando buffer de envio P2P...';
+            const tBp = performance.now();
+            await backpressure.waitUntilBelow(BUFFER_LOW, signal);
+            state.metrics.backpressureWaitMs += performance.now() - tBp;
+            state.waitStateLabel = null;
+          }
+
+          const payloadSlice = blockView.subarray(blockPos, endPos);
+          const frameBuffer = encodeDataFrame(state.transferId, seq, offset, payloadSlice);
+
+          dcData.send(frameBuffer);
 
           if (state.metrics.firstByteAt === null) {
             state.metrics.firstByteAt = performance.now();
             state.metrics.acceptToFirstByteMs = state.metrics.firstByteAt - state.metrics.acceptedAt;
           }
 
-          if (dc.bufferedAmount > state.metrics.peakBufferedAmount) {
-            state.metrics.peakBufferedAmount = dc.bufferedAmount;
+          if (dcData.bufferedAmount > state.metrics.peakBufferedAmount) {
+            state.metrics.peakBufferedAmount = dcData.bufferedAmount;
           }
 
           blockPos = endPos;
-          offset += payloadSlice.byteLength;
-          state.bytesTransferred = offset;
-          state.chunksCount += 1;
+          offset += payloadLen;
+          seq += 1;
+          state.bytesSentTransport = offset;
+          state.chunksCount = seq;
+          state.inFlightBytes = Math.max(0, state.bytesSentTransport - state.bytesAcked);
+          if (state.inFlightBytes > state.metrics.peakInFlightBytes) {
+            state.metrics.peakInFlightBytes = state.inFlightBytes;
+          }
 
-          // Adaptive chunk scaling: ramp up to maxPayload after initial chunks when buffer is healthy
-          if (state.chunksCount >= 4 && chunkSize < maxPayload && dc.bufferedAmount < BUFFER_HIGH * 0.6) {
+          if (seq >= 4 && chunkSize < maxPayload && dcData.bufferedAmount < BUFFER_HIGH * 0.5) {
             chunkSize = Math.min(maxPayload, chunkSize * 2);
           }
 
-          this._updateProgressMetrics(state, false);
+          const now = performance.now();
+          const dtSend = (now - state.metrics.lastSendSampleTime) / 1000;
+          if (dtSend >= 0.25) {
+            state.metrics.sendSpeedMBps = ((state.bytesSentTransport - state.metrics.lastSendSampleBytes) / (1024 * 1024)) / dtSend;
+            state.metrics.lastSendSampleTime = now;
+            state.metrics.lastSendSampleBytes = state.bytesSentTransport;
+          }
+
+          if (this.callbacks.onTransferProgress) {
+            this.callbacks.onTransferProgress(state, false);
+          }
         }
       }
 
-      // Wait for DataChannel buffer to drain below low-water mark (event-driven, no polling)
-      if (dc.bufferedAmount > 0) {
-        const drainStart = performance.now();
+      if (dcData.bufferedAmount > 0) {
+        const tDrain = performance.now();
         await backpressure.waitUntilBelow(0, signal);
-        state.metrics.backpressureWaitMs += performance.now() - drainStart;
+        state.metrics.backpressureWaitMs += performance.now() - tDrain;
       }
-
-      this._updateProgressMetrics(state, true);
 
       if (this.callbacks.onTransferValidating) {
-        this.callbacks.onTransferValidating(state, 'Finalizando SHA-256...');
+        this.callbacks.onTransferValidating(state, 'Finalizando SHA-256 e aguardando confirmação do receptor...');
       }
 
-      // Finalize incremental SHA-256
       const hashResult = await this.hashClient.finalize(state.transferId);
       state.sha256 = hashResult.hash;
       state.metrics.sha256DurationMs = hashResult.cpuTimeMs;
 
-      // Signal completion with definitive SHA-256
+      // Send FILE_COMPLETE on control channel
       this.sendPeerMessage(state.peerId, {
         type: 'FILE_COMPLETE',
         transferId: state.transferId,
         fileId: state.fileId,
-        totalBytes: totalBytes,
-        totalChunks: state.chunksCount,
+        totalBytes,
+        totalChunks: seq,
         sha256: state.sha256
       });
 
-      if (this.callbacks.onTransferValidating) {
-        this.callbacks.onTransferValidating(state, 'Aguardando confirmação de integridade...');
-      }
-
-      // Wait for receiver's FILE_COMPLETE_ACK matching this transferId
       const ackMsg = await new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           if (state.ackResolver === resolve) {
             state.ackResolver = null;
             state.ackRejecter = null;
-            reject(new Error('Timeout aguardando confirmação do destinatário'));
+            reject(new Error('Timeout aguardando confirmação final do destinatário'));
           }
         }, ACK_TIMEOUT_MS);
 
@@ -815,7 +1118,6 @@
           state.ackRejecter = null;
           reject(new Error('Transfer cancelled'));
         };
-
         signal.addEventListener('abort', onAbort, { once: true });
 
         state.ackResolver = (ack) => {
@@ -835,18 +1137,21 @@
       });
 
       if (ackMsg && ackMsg.ok === false) {
-        throw new Error(`Falha na validação do destinatário: ${ackMsg.reason || 'hash inválido'}`);
+        throw new Error(`Receptor rejeitou integridade: ${ackMsg.reason || 'hash inválido'}`);
       }
 
+      state.bytesAcked = totalBytes;
+      state.bytesTransferred = totalBytes;
+      state.inFlightBytes = 0;
       state.status = 'completed';
       state.metrics.completedAt = performance.now();
       state.metrics.totalDurationMs = state.metrics.completedAt - state.metrics.acceptedAt;
-      state.metrics.chunksCount = state.chunksCount;
-      state.metrics.avgChunkSizeBytes = state.chunksCount > 0 ? Math.round(totalBytes / state.chunksCount) : 0;
+      state.metrics.chunksCount = seq;
+      state.metrics.avgChunkSizeBytes = seq > 0 ? Math.round(totalBytes / seq) : 0;
       const secs = Math.max(0.001, state.metrics.totalDurationMs / 1000);
       state.metrics.avgThroughputMBps = (totalBytes / (1024 * 1024)) / secs;
       state.metrics.rtcStats = await collectRtcStats(pc);
-      state.metrics.bottleneck = classifyBottleneck(state.metrics, state.metrics.rtcStats);
+      state.metrics.bottleneck = diagnoseBottleneck(state, state.metrics.rtcStats);
 
       this.completedMetrics.push(state.metrics);
       console.info('[GhostDrop Metrics - Send]', state.metrics);
@@ -858,190 +1163,94 @@
 
     handleCompleteAck(fromPeerId, msg) {
       const state = this.transfers.get(msg.transferId);
-      if (!state || state.direction !== 'send' || state.peerId !== fromPeerId) {
-        return;
-      }
-      if (state.ackResolver) {
-        state.ackResolver(msg);
-      }
+      if (!state || state.direction !== 'send' || state.peerId !== fromPeerId) return;
+      if (state.ackResolver) state.ackResolver(msg);
     }
 
     handleFileMeta(fromPeerId, msg) {
       const state = this.transfers.get(msg.transferId);
-      if (!state || state.direction !== 'receive' || state.peerId !== fromPeerId) {
-        return;
-      }
+      if (!state || state.direction !== 'receive' || state.peerId !== fromPeerId) return;
       state.status = 'transferring';
-      if (msg.sha256) {
-        state.expectedSha256 = msg.sha256.toLowerCase();
+      if (msg.sha256) state.expectedSha256 = msg.sha256.toLowerCase();
+
+      const peer = this.getPeer(fromPeerId);
+      if (peer) {
+        this._startStatsSampling(state, peer.pc, peer.dcData || peer.dc);
       }
+
       if (this.callbacks.onTransferStart) {
         this.callbacks.onTransferStart(state);
       }
     }
 
     handleBinaryChunk(fromPeerId, arrayBuffer) {
-      const decoded = decodeChunkFrame(arrayBuffer);
-      if (!decoded) return;
+      // Peek transferId length & string only to track per-transfer firstByteAt/chunksCount;
+      // actual frame decoding, hashing, and storage run in Receiver Worker with zero-copy transfer.
+      const view = new Uint8Array(arrayBuffer);
+      if (view.byteLength < 15 || view[0] !== FRAME_MAGIC) return;
+      const idLen = view[1];
+      if (view.byteLength < 2 + idLen + 12) return;
+      const transferId = textDecoder.decode(view.subarray(2, 2 + idLen));
 
-      const state = this.transfers.get(decoded.transferId);
-      if (!state || state.direction !== 'receive' || state.peerId !== fromPeerId) {
-        return;
-      }
-      if (state.status === 'cancelled' || state.status === 'failed' || state.status === 'completed') {
-        return;
-      }
+      const state = this.transfers.get(transferId);
+      if (!state || state.direction !== 'receive' || state.peerId !== fromPeerId) return;
+      if (['cancelled', 'failed', 'completed'].includes(state.status)) return;
 
       if (state.metrics.firstByteAt === null) {
         state.metrics.firstByteAt = performance.now();
         state.metrics.acceptToFirstByteMs = state.metrics.firstByteAt - state.metrics.acceptedAt;
       }
-
-      const payload = decoded.payloadView;
-      state.bytesTransferred += payload.byteLength;
       state.chunksCount += 1;
 
-      // Feed incremental SHA-256 worker & storage sink in parallel
-      this.hashClient.update(state.transferId, payload, false);
-      state.sink.write(payload).catch((err) => {
-        console.error('[ReceiverSink] Write error:', err);
-        this.cancelTransfer(state.transferId, 'sink_write_error', false);
-      });
-
-      this._updateProgressMetrics(state, false);
-
-      if (state.pendingCompleteMsg && state.bytesTransferred >= state.size && !state.finalizing) {
-        const comp = state.pendingCompleteMsg;
-        state.pendingCompleteMsg = null;
-        this._finalizeReceiveTransfer(state, comp);
-      }
+      this.receiverWorker.pushChunk(arrayBuffer);
     }
 
     handleFileComplete(fromPeerId, msg) {
       const state = this.transfers.get(msg.transferId);
-      if (!state || state.direction !== 'receive' || state.peerId !== fromPeerId) {
-        return;
-      }
-      if (state.status === 'cancelled' || state.status === 'failed' || state.status === 'completed') {
-        return;
-      }
+      if (!state || state.direction !== 'receive' || state.peerId !== fromPeerId) return;
+      if (['cancelled', 'failed', 'completed'].includes(state.status)) return;
 
-      if (state.bytesTransferred < state.size) {
-        state.pendingCompleteMsg = msg;
-        return;
-      }
-
-      if (!state.finalizing) {
-        this._finalizeReceiveTransfer(state, msg);
+      const expectedSize = typeof msg.totalBytes === 'number' ? msg.totalBytes : state.size;
+      state.pendingCompleteMsg = msg;
+      if (state.bytesWritten >= expectedSize && !state.finalizing) {
+        state.pendingCompleteMsg = null;
+        this._triggerReceiverFinalize(state, msg);
       }
     }
 
-    async _finalizeReceiveTransfer(state, completeMsg) {
+    _triggerReceiverFinalize(state, completeMsg) {
+      if (state.finalizing) return;
       state.finalizing = true;
       state.status = 'validating';
-      this._updateProgressMetrics(state, true);
+      state.validationStartTime = performance.now();
 
       if (this.callbacks.onTransferValidating) {
-        this.callbacks.onTransferValidating(state, 'Validando integridade SHA-256...');
+        this.callbacks.onTransferValidating(state, 'Validando sequência, gravação e SHA-256...');
       }
 
-      const validationStart = performance.now();
-      try {
-        const expectedHash = (completeMsg.sha256 || state.expectedSha256 || '').toLowerCase();
-        const expectedSize = typeof completeMsg.totalBytes === 'number' ? completeMsg.totalBytes : state.size;
-
-        const [hashResult, sinkResult] = await Promise.all([
-          this.hashClient.finalize(state.transferId),
-          state.sink.close()
-        ]);
-
-        const calculatedHash = hashResult.hash.toLowerCase();
-        state.sha256 = calculatedHash;
-        state.metrics.sha256DurationMs = hashResult.cpuTimeMs;
-        state.metrics.validationDurationMs = performance.now() - validationStart;
-
-        const sizeMatches = state.bytesTransferred === expectedSize;
-        const hashMatches = Boolean(expectedHash) && calculatedHash === expectedHash;
-
-        if (!sizeMatches || !hashMatches) {
-          const reason = !sizeMatches ? 'size_mismatch' : 'hash_mismatch';
-          await state.sink.abort();
-          this.sendPeerMessage(state.peerId, {
-            type: 'FILE_COMPLETE_ACK',
-            transferId: state.transferId,
-            ok: false,
-            sha256: calculatedHash,
-            reason
-          });
-          state.status = 'failed';
-          const err = new Error(
-            !sizeMatches
-              ? `Tamanho divergente: recebido ${state.bytesTransferred}, esperado ${expectedSize}`
-              : `Hash SHA-256 inválido: esperado ${expectedHash.slice(0, 12)}..., obtido ${calculatedHash.slice(0, 12)}...`
-          );
-          if (this.callbacks.onTransferError) {
-            this.callbacks.onTransferError(state, err);
-          }
-          return;
-        }
-
-        // Integrity confirmed — send ACK only now!
-        this.sendPeerMessage(state.peerId, {
-          type: 'FILE_COMPLETE_ACK',
-          transferId: state.transferId,
-          ok: true,
-          sha256: calculatedHash
-        });
-
-        state.status = 'completed';
-        state.metrics.completedAt = performance.now();
-        state.metrics.totalDurationMs = state.metrics.completedAt - state.metrics.acceptedAt;
-        state.metrics.chunksCount = state.chunksCount;
-        state.metrics.avgChunkSizeBytes = state.chunksCount > 0 ? Math.round(state.bytesTransferred / state.chunksCount) : 0;
-        const secs = Math.max(0.001, state.metrics.totalDurationMs / 1000);
-        state.metrics.avgThroughputMBps = (state.bytesTransferred / (1024 * 1024)) / secs;
-
-        const peer = this.getPeer(state.peerId);
-        state.metrics.rtcStats = peer ? await collectRtcStats(peer.pc) : null;
-        state.metrics.bottleneck = classifyBottleneck(state.metrics, state.metrics.rtcStats);
-
-        this.completedMetrics.push(state.metrics);
-        console.info('[GhostDrop Metrics - Receive]', state.metrics);
-
-        if (this.callbacks.onTransferComplete) {
-          this.callbacks.onTransferComplete(state, sinkResult);
-        }
-      } catch (err) {
-        state.status = 'failed';
-        await state.sink.abort();
-        this.sendPeerMessage(state.peerId, {
-          type: 'FILE_COMPLETE_ACK',
-          transferId: state.transferId,
-          ok: false,
-          reason: err.message || 'validation_error'
-        });
-        if (this.callbacks.onTransferError) {
-          this.callbacks.onTransferError(state, err);
-        }
-      }
+      this.receiverWorker.finalizeJob({
+        transferId: state.transferId,
+        expectedSha256: completeMsg.sha256 || state.expectedSha256 || '',
+        expectedSize: typeof completeMsg.totalBytes === 'number' ? completeMsg.totalBytes : state.size
+      });
     }
 
     cancelTransfer(transferId, reason = 'user_cancelled', notifyPeer = true) {
       const state = this.transfers.get(transferId);
-      if (!state) return;
-      if (state.status === 'completed' || state.status === 'cancelled') return;
+      if (!state || state.status === 'completed' || state.status === 'cancelled') return;
 
       state.status = 'cancelled';
+      this._stopStatsSampling(state);
       state.abortController.abort();
-      this.hashClient.abort(transferId);
-      clearHeaderCache(transferId);
+      clearEncodedId(transferId);
 
-      if (state.ackRejecter) {
-        state.ackRejecter(new Error('Transfer cancelled'));
+      if (state.direction === 'send') {
+        this.hashClient.abort(transferId);
+        if (state.ackRejecter) state.ackRejecter(new Error('Transfer cancelled'));
+      } else {
+        this.receiverWorker.abortJob(transferId);
       }
-      if (state.sink) {
-        state.sink.abort();
-      }
+
       if (notifyPeer) {
         this.sendPeerMessage(state.peerId, {
           type: 'TRANSFER_CANCELLED',
@@ -1063,9 +1272,8 @@
         }
         return;
       }
-      // Fallback if a legacy peer sent TRANSFER_CANCELLED without transferId
       for (const state of this.transfers.values()) {
-        if (state.peerId === fromPeerId && (state.status === 'transferring' || state.status === 'accepted')) {
+        if (state.peerId === fromPeerId && ['transferring', 'accepted', 'initializing'].includes(state.status)) {
           this.cancelTransfer(state.transferId, 'remote_cancelled', false);
         }
       }
@@ -1073,7 +1281,7 @@
 
     cancelTransfersForPeer(peerId) {
       for (const state of this.transfers.values()) {
-        if (state.peerId === peerId && state.status !== 'completed' && state.status !== 'cancelled' && state.status !== 'failed') {
+        if (state.peerId === peerId && !['completed', 'cancelled', 'failed'].includes(state.status)) {
           this.cancelTransfer(state.transferId, 'peer_disconnected', false);
         }
       }
@@ -1086,19 +1294,35 @@
       this.transfers.clear();
     }
 
-    _updateProgressMetrics(state, force) {
-      const now = performance.now();
-      const timeDeltaMs = now - state.metrics.lastSampleTime;
-      if (force || timeDeltaMs >= 250) {
-        const secs = Math.max(0.001, timeDeltaMs / 1000);
-        const bytesDelta = state.bytesTransferred - state.metrics.lastSampleBytes;
-        const speedBps = bytesDelta / secs;
-        state.metrics.instantThroughputMBps = speedBps / (1024 * 1024);
-        state.metrics.lastSampleTime = now;
-        state.metrics.lastSampleBytes = state.bytesTransferred;
-      }
-      if (this.callbacks.onTransferProgress) {
-        this.callbacks.onTransferProgress(state, force);
+    _startStatsSampling(state, pc, dcData) {
+      if (!pc || state.statsTimer) return;
+      state.statsTimer = setInterval(async () => {
+        if (['completed', 'cancelled', 'failed'].includes(state.status)) {
+          this._stopStatsSampling(state);
+          return;
+        }
+        const stats = await collectRtcStats(pc);
+        if (stats) {
+          state.metrics.rtcStats = stats;
+          state.metrics.statsSamples.push({
+            t: Math.round(performance.now() - (state.metrics.acceptedAt || performance.now())),
+            rttMs: stats.rttMs,
+            bufferedAmount: dcData ? dcData.bufferedAmount : 0,
+            inFlightBytes: state.inFlightBytes || 0,
+            bytesAcked: state.bytesAcked || 0,
+            bytesWritten: state.bytesWritten || 0
+          });
+          if (state.metrics.statsSamples.length > 120) {
+            state.metrics.statsSamples.shift();
+          }
+        }
+      }, STATS_INTERVAL_MS);
+    }
+
+    _stopStatsSampling(state) {
+      if (state.statsTimer) {
+        clearInterval(state.statsTimer);
+        state.statsTimer = null;
       }
     }
   }
@@ -1106,17 +1330,16 @@
   const exportsObj = {
     TransferManager,
     Sha256WorkerClient,
+    ReceiverWorkerClient,
     DataChannelBackpressure,
-    BlobFileSink,
-    FileSystemFileSink,
-    createReceiverSink,
-    encodeChunkFrame,
-    decodeChunkFrame,
+    encodeDataFrame,
     collectRtcStats,
-    classifyBottleneck,
+    diagnoseBottleneck,
     resolveMaxPayloadSize,
+    pickSaveFileHandleIfAvailable,
     BUFFER_HIGH,
-    BUFFER_LOW
+    BUFFER_LOW,
+    INITIAL_WINDOW_BYTES
   };
 
   if (typeof module !== 'undefined' && module.exports) {

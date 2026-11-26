@@ -56,15 +56,19 @@ function initTransferManager() {
   if (transferManager || typeof GhostDropTransfer === 'undefined') return;
   transferManager = new GhostDropTransfer.TransferManager({
     myPeerId,
-    workerPath: 'sha256-worker.js',
+    sha256WorkerPath: 'sha256-worker.js',
+    receiverWorkerPath: 'receiver-worker.js',
     getPeer: (peerId) => connectedPeers.get(peerId),
     sendPeerMessage: (peerId, msg) => sendPeerAppMessage(peerId, msg),
     callbacks: {
       onTransferStart: (state) => {
         activeModalTransferId = state.transferId;
+        const backendTag = state.direction === 'receive' && state.storageBackend
+          ? ` [${state.storageBackend}]`
+          : '';
         const label = state.direction === 'send'
           ? `Enviando para ${state.peerNickname}...`
-          : `Recebendo de ${state.peerNickname}...`;
+          : `Recebendo de ${state.peerNickname}${backendTag}...`;
         openTransferModal(state.name, state.size, label, state.transferId);
       },
       onTransferProgress: (state, force) => {
@@ -80,19 +84,21 @@ function initTransferManager() {
         const metrics = state.metrics;
         const avgMBps = metrics.avgThroughputMBps ? metrics.avgThroughputMBps.toFixed(2) : '0.00';
         const rttInfo = metrics.rtcStats && metrics.rtcStats.rttMs !== null
-          ? ` • RTT ${metrics.rtcStats.rttMs}ms (${metrics.rtcStats.localCandidateType}${metrics.rtcStats.usingTurnRelay ? '/TURN' : ''})`
+          ? ` • RTT ${metrics.rtcStats.rttMs}ms (${metrics.rtcStats.localCandidateType}${metrics.rtcStats.usingTurnRelay ? '/TURN' : '/Direto'})`
           : '';
 
         let blobUrl = null;
-        if (state.direction === 'receive' && sinkResult && sinkResult.blob) {
-          blobUrl = URL.createObjectURL(sinkResult.blob);
-          downloadBlob(sinkResult.blob, state.name);
+        const downloadableObj = sinkResult ? (sinkResult.file || sinkResult.blob) : null;
+        if (state.direction === 'receive' && downloadableObj) {
+          blobUrl = URL.createObjectURL(downloadableObj);
+          downloadBlob(downloadableObj, state.name);
         }
 
         if (activeModalTransferId === state.transferId) {
           progressBarFill.style.width = '100%';
           transferPercent.textContent = '100%';
           transferSpeed.textContent = `${avgMBps} MB/s`;
+          transferBytes.textContent = `${formatBytes(state.size)} / ${formatBytes(state.size)}`;
           transferEta.textContent = `${(metrics.totalDurationMs / 1000).toFixed(2)}s`;
           transferHash.textContent = `✓ ${(state.sha256 || '').substring(0, 16)}... (Válido)`;
           transferHash.style.color = '#10b981';
@@ -122,6 +128,7 @@ function initTransferManager() {
           sha256: state.sha256 || '',
           sender: state.direction === 'send' ? myNickname : state.peerNickname,
           blobUrl: blobUrl,
+          cleanupOpfs: sinkResult && sinkResult.cleanupOpfs ? sinkResult.cleanupOpfs : null,
           metrics: metrics
         });
       },
@@ -587,8 +594,8 @@ function setupEventListeners() {
 
     if (offer) {
       initTransferManager();
-      const { sink, userCancelled } = await GhostDropTransfer.createReceiverSink(offer.name, offer.mimeType);
-      if (userCancelled || !sink) {
+      const { fileHandle, userCancelled } = await GhostDropTransfer.pickSaveFileHandleIfAvailable(offer.name);
+      if (userCancelled) {
         sendPeerAppMessage(offer.senderPeerId, {
           type: 'FILE_OFFER_REJECTED',
           transferId: offer.transferId,
@@ -598,14 +605,27 @@ function setupEventListeners() {
           reason: 'save_dialog_cancelled'
         });
       } else {
-        transferManager.registerReceiveTransfer(offer, sink);
-        sendPeerAppMessage(offer.senderPeerId, {
-          type: 'FILE_OFFER_ACCEPTED',
-          transferId: offer.transferId,
-          fileId: offer.fileId,
-          targetPeerId: offer.senderPeerId,
-          fromPeerId: myPeerId
-        });
+        try {
+          const recvState = await transferManager.prepareReceiveTransfer(offer, fileHandle);
+          sendPeerAppMessage(offer.senderPeerId, {
+            type: 'FILE_OFFER_ACCEPTED',
+            transferId: offer.transferId,
+            fileId: offer.fileId,
+            targetPeerId: offer.senderPeerId,
+            fromPeerId: myPeerId,
+            windowBytes: recvState.windowBytes
+          });
+        } catch (err) {
+          alert(`Não foi possível iniciar o recebimento: ${err.message || err}`);
+          sendPeerAppMessage(offer.senderPeerId, {
+            type: 'FILE_OFFER_REJECTED',
+            transferId: offer.transferId,
+            fileId: offer.fileId,
+            targetPeerId: offer.senderPeerId,
+            fromPeerId: myPeerId,
+            reason: err.message || 'init_failed'
+          });
+        }
       }
     }
     showNextIncomingOffer();
@@ -853,16 +873,19 @@ function getOrCreatePeer(peerId, nickname, isPolite) {
   return initPeerConnection(peerId, nickname, isPolite);
 }
 
-// Initialize WebRTC Peer Connection (DataChannel only)
+// Initialize WebRTC Peer Connection (Dual DataChannels: Control id=0, Binary Data id=1)
 function initPeerConnection(targetPeerId, targetNickname, isPolite) {
   const pc = new RTCPeerConnection(STUN_SERVERS);
-  const dc = pc.createDataChannel('ghostdrop', { negotiated: true, id: 0 });
-  dc.binaryType = 'arraybuffer';
+  const dcCtrl = pc.createDataChannel('ghostdrop-ctrl', { negotiated: true, id: 0 });
+  const dcData = pc.createDataChannel('ghostdrop-data', { negotiated: true, id: 1 });
+  dcData.binaryType = 'arraybuffer';
 
   const peerObj = {
     peerId: targetPeerId,
     pc: pc,
-    dc: dc,
+    dc: dcCtrl,
+    dcCtrl: dcCtrl,
+    dcData: dcData,
     nickname: targetNickname,
     isPolite: isPolite,
     state: 'connecting',
@@ -872,19 +895,26 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
   renderParticipantsList();
 
   function markConnected() {
-    if (peerObj.state !== 'connected') {
+    if (peerObj.state !== 'connected' && dcCtrl.readyState === 'open') {
       peerObj.state = 'connected';
       renderParticipantsList();
     }
   }
 
-  setupDataChannelListeners(targetPeerId, dc, markConnected);
+  setupControlChannelListeners(targetPeerId, dcCtrl, markConnected);
+  setupDataChannelListeners(targetPeerId, dcData);
 
   pc.ondatachannel = (event) => {
-    const remoteDc = event.channel;
-    remoteDc.binaryType = 'arraybuffer';
-    peerObj.dc = remoteDc;
-    setupDataChannelListeners(targetPeerId, remoteDc, markConnected);
+    const ch = event.channel;
+    if (ch.label === 'ghostdrop-data' || ch.id === 1) {
+      ch.binaryType = 'arraybuffer';
+      peerObj.dcData = ch;
+      setupDataChannelListeners(targetPeerId, ch);
+    } else {
+      peerObj.dc = ch;
+      peerObj.dcCtrl = ch;
+      setupControlChannelListeners(targetPeerId, ch, markConnected);
+    }
   };
 
   pc.onicecandidate = (event) => {
@@ -905,7 +935,10 @@ function initPeerConnection(targetPeerId, targetNickname, isPolite) {
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === 'connected') {
       markConnected();
-    } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+    } else if (pc.connectionState === 'failed') {
+      appendSystemMessage(`⚠️ Conexão P2P direta com <strong>${escapeHtml(peerObj.nickname)}</strong> falhou (NAT/firewall restritivo; sem relay intermediário).`);
+      removePeer(targetPeerId);
+    } else if (pc.connectionState === 'disconnected') {
       removePeer(targetPeerId);
     }
   };
@@ -1007,8 +1040,8 @@ async function handleIceCandidate(targetPeerId, candidateObj) {
   } catch (err) { }
 }
 
-// Data Channel Handlers
-function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
+// Control Channel Handlers (JSON control, chat, credits, ACKs)
+function setupControlChannelListeners(targetPeerId, channel, onConnectedCallback) {
   channel.onopen = () => {
     const peer = connectedPeers.get(targetPeerId);
     if (onConnectedCallback) onConnectedCallback();
@@ -1030,23 +1063,33 @@ function setupDataChannelListeners(targetPeerId, channel, onConnectedCallback) {
   };
 
   channel.onerror = (err) => {
-    console.warn(`[DataChannel] Erro com ${targetPeerId}:`, err);
+    console.warn(`[ControlChannel] Erro com ${targetPeerId}:`, err);
   };
 
   channel.onmessage = (event) => {
-    // 1. Binary chunk received
-    if (event.data instanceof ArrayBuffer) {
-      initTransferManager();
-      transferManager.handleBinaryChunk(targetPeerId, event.data);
-      return;
-    }
-
-    // 2. Text/JSON message
     try {
       const msg = JSON.parse(event.data);
       onDataMessage(targetPeerId, msg);
     } catch (e) {
-      console.warn('[DataChannel] Erro ao decodificar JSON:', e);
+      console.warn('[ControlChannel] Erro ao decodificar JSON:', e);
+    }
+  };
+}
+
+// Binary Data Channel Handlers (File frames only)
+function setupDataChannelListeners(targetPeerId, channel) {
+  channel.onclose = () => {
+    removePeer(targetPeerId);
+  };
+
+  channel.onerror = (err) => {
+    console.warn(`[DataChannel] Erro com ${targetPeerId}:`, err);
+  };
+
+  channel.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      initTransferManager();
+      transferManager.handleBinaryChunk(targetPeerId, event.data);
     }
   };
 }
@@ -1118,7 +1161,12 @@ function onDataMessage(fromPeerId, msg) {
     initTransferManager();
     transferManager.handleCompleteAck(fromPeerId, msg);
   }
-  // 11. Transfer Cancelled
+  // 11. Receiver Credit / Flow Control Update
+  else if (msg.type === 'TRANSFER_CREDIT') {
+    initTransferManager();
+    transferManager.handleTransferCredit(fromPeerId, msg);
+  }
+  // 12. Transfer Cancelled
   else if (msg.type === 'TRANSFER_CANCELLED') {
     initTransferManager();
     transferManager.handleRemoteCancel(fromPeerId, msg);
@@ -1145,7 +1193,9 @@ function removePeer(peerId) {
       appendSystemMessage(`🚪 <strong>${escapeHtml(peer.nickname)}</strong> desconectou-se da sala.`);
     }
     try {
-      if (peer.dc) peer.dc.close();
+      if (peer.dcCtrl) peer.dcCtrl.close();
+      if (peer.dcData) peer.dcData.close();
+      if (peer.dc && peer.dc !== peer.dcCtrl) peer.dc.close();
       if (peer.pc) peer.pc.close();
     } catch (e) { }
     connectedPeers.delete(peerId);
@@ -1388,30 +1438,58 @@ function renderTransfersList() {
   });
 }
 
-// Update UI Progress Metrics (Throttled to keep main event loop free for SCTP ACKs)
+// Update UI Progress Metrics (Honest accounting: confirmed/written bytes vs queued bytes)
 let lastUiProgressTime = 0;
 function updateTransferProgressUI(state, force = false) {
   const now = performance.now();
-  if (!force && now - lastUiProgressTime < 80) return;
+  if (!force && now - lastUiProgressTime < 100) return;
   lastUiProgressTime = now;
 
-  const current = state.bytesTransferred;
   const total = state.size || 1;
-  const percent = Math.min(100, Math.round((current / total) * 100));
-  progressBarFill.style.width = percent + '%';
-  transferPercent.textContent = percent + '%';
-  transferBytes.textContent = `${formatBytes(current)} / ${formatBytes(state.size)}`;
+  if (state.direction === 'send') {
+    const acked = state.bytesAcked || 0;
+    const sent = state.bytesSentTransport || 0;
+    const percent = Math.min(100, Math.round((acked / total) * 100));
+    progressBarFill.style.width = percent + '%';
+    transferPercent.textContent = percent + '%';
+    transferBytes.textContent = `${formatBytes(acked)} confirmados / ${formatBytes(state.size)} (${formatBytes(sent)} env.)`;
 
-  const speedMBps = state.metrics.instantThroughputMBps || 0;
-  transferSpeed.textContent = speedMBps.toFixed(1) + ' MB/s';
+    const effectiveSpeed = state.metrics.ackedSpeedMBps || 0;
+    transferSpeed.textContent = effectiveSpeed.toFixed(2) + ' MB/s';
 
-  const speedBps = speedMBps * 1024 * 1024;
-  if (speedBps > 0) {
-    const remainingBytes = Math.max(0, state.size - current);
-    const remainingSeconds = Math.round(remainingBytes / speedBps);
-    transferEta.textContent = remainingSeconds < 60
-      ? `${remainingSeconds}s`
-      : `${Math.floor(remainingSeconds / 60)}m ${remainingSeconds % 60}s`;
+    if (state.waitStateLabel) {
+      transferStatePill.textContent = state.waitStateLabel;
+    } else {
+      transferStatePill.textContent = `Enviando para ${state.peerNickname}...`;
+    }
+
+    const speedBps = effectiveSpeed * 1024 * 1024;
+    if (speedBps > 0) {
+      const remainingBytes = Math.max(0, state.size - acked);
+      const remainingSeconds = Math.round(remainingBytes / speedBps);
+      transferEta.textContent = remainingSeconds < 60
+        ? `${remainingSeconds}s`
+        : `${Math.floor(remainingSeconds / 60)}m ${remainingSeconds % 60}s`;
+    }
+  } else {
+    const written = state.bytesWritten || 0;
+    const received = state.bytesReceived || 0;
+    const percent = Math.min(100, Math.round((written / total) * 100));
+    progressBarFill.style.width = percent + '%';
+    transferPercent.textContent = percent + '%';
+    transferBytes.textContent = `${formatBytes(written)} gravados / ${formatBytes(state.size)} (${formatBytes(received)} rec.)`;
+
+    const speedMBps = state.metrics.instantThroughputMBps || 0;
+    transferSpeed.textContent = speedMBps.toFixed(2) + ' MB/s';
+
+    const speedBps = speedMBps * 1024 * 1024;
+    if (speedBps > 0) {
+      const remainingBytes = Math.max(0, state.size - written);
+      const remainingSeconds = Math.round(remainingBytes / speedBps);
+      transferEta.textContent = remainingSeconds < 60
+        ? `${remainingSeconds}s`
+        : `${Math.floor(remainingSeconds / 60)}m ${remainingSeconds % 60}s`;
+    }
   }
 }
 
@@ -1455,12 +1533,19 @@ function resetAllConnections() {
   if (transferManager) {
     transferManager.cancelAll();
   }
+  sessionTransfers.forEach(item => {
+    if (typeof item.cleanupOpfs === 'function') {
+      try { item.cleanupOpfs(); } catch (e) { }
+    }
+  });
   incomingOfferQueue.length = 0;
   activeIncomingOffer = null;
   activeModalTransferId = null;
   connectedPeers.forEach(peer => {
     try {
-      if (peer.dc) peer.dc.close();
+      if (peer.dcCtrl) peer.dcCtrl.close();
+      if (peer.dcData) peer.dcData.close();
+      if (peer.dc && peer.dc !== peer.dcCtrl) peer.dc.close();
       if (peer.pc) peer.pc.close();
     } catch (e) { }
   });
