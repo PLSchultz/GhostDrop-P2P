@@ -11,9 +11,9 @@ if (typeof importScripts === 'function') {
 }
 
 const FRAME_MAGIC = 0x47; // 'G'
-const MIN_WINDOW_BYTES = 512 * 1024;       // 512 KB
-const INITIAL_WINDOW_BYTES = 2 * 1024 * 1024; // 2 MB
-const MAX_WINDOW_BYTES = 16 * 1024 * 1024; // 16 MB
+const MIN_WINDOW_BYTES = 1 * 1024 * 1024;    // 1 MB floor
+const INITIAL_WINDOW_BYTES = 8 * 1024 * 1024; // 8 MB initial window (matches 90812fb SCTP pipe)
+const MAX_WINDOW_BYTES = 16 * 1024 * 1024;   // 16 MB ceiling
 
 const textDecoder = new TextDecoder();
 
@@ -218,20 +218,23 @@ class ReceiverJobManager {
   _maybeEmitCredit(job, seq, force = false) {
     const now = performance.now();
     const unacked = job.bytesWritten - job.lastCreditAcked;
-    const creditStep = Math.max(64 * 1024, Math.floor(job.windowBytes / 4));
+    const creditStep = Math.max(256 * 1024, Math.min(1024 * 1024, Math.floor(job.windowBytes / 8)));
     const dtSpeed = now - job.lastSpeedTime;
 
-    if (dtSpeed >= 250) {
+    if (dtSpeed >= 200) {
       const secs = Math.max(0.001, dtSpeed / 1000);
-      job.writeSpeedBps = (job.bytesWritten - job.lastSpeedBytes) / secs;
+      const instantBps = (job.bytesWritten - job.lastSpeedBytes) / secs;
+      job.writeSpeedBps = job.writeSpeedBps > 0
+        ? job.writeSpeedBps * 0.7 + instantBps * 0.3
+        : instantBps;
       job.lastSpeedTime = now;
       job.lastSpeedBytes = job.bytesWritten;
     }
 
-    if (force || unacked >= creditStep || job.bytesWritten >= job.size || (unacked > 0 && now - job.lastCreditTime >= 80)) {
-      // Adaptive window: scale based on write throughput, keeping memory bounded
+    if (force || unacked >= creditStep || job.bytesWritten >= job.size || (unacked > 0 && now - job.lastCreditTime >= 40)) {
+      // Adaptive window: keep ~850ms of smoothed receiver capacity in flight, bounded [1MB, 16MB]
       if (job.writeSpeedBps > 0) {
-        const target = Math.round(job.writeSpeedBps * 0.35); // ~350ms of receiver capacity in flight
+        const target = Math.round(job.writeSpeedBps * 0.85);
         job.windowBytes = Math.max(MIN_WINDOW_BYTES, Math.min(MAX_WINDOW_BYTES, target));
       }
 

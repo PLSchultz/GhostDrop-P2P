@@ -21,9 +21,9 @@
   const INITIAL_CHUNK_SIZE = 64 * 1024; // 64 KB
   const READ_BLOCK_SIZE = 2 * 1024 * 1024; // 2 MB read-ahead block
 
-  const BUFFER_HIGH = 4 * 1024 * 1024; // 4 MB SCTP send buffer high-water
-  const BUFFER_LOW = 1 * 1024 * 1024;  // 1 MB SCTP send buffer low-water
-  const INITIAL_WINDOW_BYTES = 2 * 1024 * 1024; // 2 MB initial receiver credit window
+  const BUFFER_HIGH = 8 * 1024 * 1024; // 8 MB SCTP send buffer high-water (matches 90812fb)
+  const BUFFER_LOW = 2 * 1024 * 1024;  // 2 MB SCTP send buffer low-water (matches 90812fb)
+  const INITIAL_WINDOW_BYTES = 8 * 1024 * 1024; // 8 MB initial receiver credit window
   const ACK_TIMEOUT_MS = 60_000;
   const STATS_INTERVAL_MS = 500;
 
@@ -984,9 +984,9 @@
       const totalBytes = file.size;
       let offset = 0;
       let seq = 0;
-      let chunkSize = totalBytes < 512 * 1024
-        ? Math.min(maxPayload, 32 * 1024)
-        : Math.min(maxPayload, INITIAL_CHUNK_SIZE);
+      let chunkSize = totalBytes < 1024 * 1024
+        ? Math.min(maxPayload, 64 * 1024)
+        : Math.min(maxPayload, DEFAULT_MAX_CHUNK);
 
       let nextReadOffset = Math.min(READ_BLOCK_SIZE, totalBytes);
       let currentBlockPromise = totalBytes > 0

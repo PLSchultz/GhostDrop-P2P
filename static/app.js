@@ -56,8 +56,8 @@ function initTransferManager() {
   if (transferManager || typeof GhostDropTransfer === 'undefined') return;
   transferManager = new GhostDropTransfer.TransferManager({
     myPeerId,
-    sha256WorkerPath: 'sha256-worker.js',
-    receiverWorkerPath: 'receiver-worker.js',
+    sha256WorkerPath: 'sha256-worker.js?v=2.0.0',
+    receiverWorkerPath: 'receiver-worker.js?v=2.0.0',
     getPeer: (peerId) => connectedPeers.get(peerId),
     sendPeerMessage: (peerId, msg) => sendPeerAppMessage(peerId, msg),
     callbacks: {
@@ -260,9 +260,12 @@ document.addEventListener('DOMContentLoaded', () => {
   initNickname();
   setupEventListeners();
 
-  // Fetch local LAN IP from server info endpoint
+  // Fetch local LAN IP from server info endpoint (only when running local Python server)
   fetch('/api/info')
-    .then(r => r.json())
+    .then(r => {
+      const ct = r.headers.get('content-type') || '';
+      return r.ok && ct.includes('application/json') ? r.json() : null;
+    })
     .then(data => {
       if (data && data.lan_ip) localLanIp = data.lan_ip;
       if (data && data.port) localServerPort = data.port;
